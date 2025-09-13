@@ -2600,6 +2600,58 @@ if uploaded_files:
     st.write(f"Uploaded {len(uploaded_files)} file(s)")
 
     # Process button
+    # if st.button("Process Invoices"):
+    #     try:
+    #         with st.spinner('Processing invoices...'):
+    #             # Extract data based on selected vendor
+    #             extracted_data = process_pdfs(uploaded_files, selected_vendor)
+
+    #             if extracted_data:
+    #                 # Display extracted data
+    #                 df = pd.DataFrame(extracted_data)
+
+    #                 # Show success message
+    #                 st.success(f"Successfully extracted data from {len(uploaded_files)} invoice(s)")
+
+    #                 # Display preview
+    #                 st.subheader("Extracted Data Preview")
+    #                 st.dataframe(df)
+
+    #                 # Download button for CSV
+    #                 csv = df.to_csv(index=False)
+    #                 st.download_button(
+    #                     label="Download CSV",
+    #                     data=csv,
+    #                     file_name="extracted_invoice_data.csv",
+    #                     mime="text/csv"
+    #                 )
+
+    #                 # Show summary
+    #                 st.subheader("Extraction Summary")
+    #                 st.write(f"Total items extracted: {len(extracted_data)}")
+    #                 st.write(f"Total invoices processed: {len(uploaded_files)}")
+
+    #                 # Show items per invoice with page numbers
+    #                 st.write("Items per Invoice:")
+    #                 for invoice_num in df['invoice_number'].unique():
+    #                     invoice_data = df[df['invoice_number'] == invoice_num]
+    #                     pages = invoice_data['page_number'].unique()
+    #                     num_items = len(invoice_data)
+    #                     st.write(f"Invoice {invoice_num}:")
+    #                     st.write(f"  - Total items: {num_items}")
+    #                     st.write(f"  - Pages with items: {sorted(pages)}")
+    #             else:
+    #                 st.warning("No data could be extracted from the invoice(s).")
+
+    #     except Exception as e:
+    #         st.error(f"Error processing invoice(s): {str(e)}")
+    #         st.text("Full error:")
+    #         st.exception(e)
+
+if uploaded_files:
+    st.write(f"Uploaded {len(uploaded_files)} file(s)")
+
+    # Process button
     if st.button("Process Invoices"):
         try:
             with st.spinner('Processing invoices...'):
@@ -2631,15 +2683,39 @@ if uploaded_files:
                     st.write(f"Total items extracted: {len(extracted_data)}")
                     st.write(f"Total invoices processed: {len(uploaded_files)}")
 
-                    # Show items per invoice with page numbers
+                    # Show items per invoice with page numbers - WITH ERROR HANDLING
                     st.write("Items per Invoice:")
                     for invoice_num in df['invoice_number'].unique():
                         invoice_data = df[df['invoice_number'] == invoice_num]
-                        pages = invoice_data['page_number'].unique()
                         num_items = len(invoice_data)
+                        
                         st.write(f"Invoice {invoice_num}:")
                         st.write(f"  - Total items: {num_items}")
-                        st.write(f"  - Pages with items: {sorted(pages)}")
+                        
+                        # Handle page information - check if column exists
+                        if 'page_number' in invoice_data.columns:
+                            pages = invoice_data['page_number'].unique()
+                            st.write(f"  - Pages with items: {sorted(pages)}")
+                        elif 'page' in invoice_data.columns:
+                            pages = invoice_data['page'].unique()
+                            st.write(f"  - Pages with items: {sorted(pages)}")
+                        else:
+                            st.write(f"  - Page information: Not available")
+                            
+                        # Show PO number if available
+                        if 'po_number' in invoice_data.columns and not invoice_data['po_number'].isnull().all():
+                            po_numbers = invoice_data['po_number'].unique()
+                            if len(po_numbers) > 0:
+                                st.write(f"  - PO Numbers: {', '.join(map(str, po_numbers))}")
+                        
+                        # Show order number if available
+                        if 'order_number' in invoice_data.columns and not invoice_data['order_number'].isnull().all():
+                            order_numbers = invoice_data['order_number'].unique()
+                            if len(order_numbers) > 0:
+                                st.write(f"  - Order Numbers: {', '.join(map(str, order_numbers))}")
+                        
+                        st.write("")  # Empty line for spacing
+
                 else:
                     st.warning("No data could be extracted from the invoice(s).")
 
