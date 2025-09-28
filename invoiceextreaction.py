@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import pdfplumber
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import io
 
 def _extract_invoice_info(lines: List[str]) -> Dict[str, str]:
@@ -7324,7 +7324,7 @@ def _parse_ilg_item_block(block: List[str], invoice_data: Dict, page_num: int) -
     return None
 
 
-#Josef Betzler
+#Josef Betzler (Partial)
 def extract_josef_betzler_invoice_data(pdf_content: bytes) -> List[Dict]:
     """
     Extract data from Josef Betzler invoice format.
@@ -7342,61 +7342,194 @@ def extract_josef_betzler_invoice_data(pdf_content: bytes) -> List[Dict]:
             # Extract invoice-level info
             invoice_data = _extract_josef_betzler_invoice_info(lines)
             
-            # Find item records
-            item_blocks = []
-            current_block = []
-            in_record = False
-            in_items_section = False
-            found_first_orderconfirmation = False
+            # Use a simpler approach - find items directly
+            item_blocks = _find_josef_betzler_items_directly(lines, invoice_data, page_num)
             
-            for i, line in enumerate(lines):
-                line_clean = line.strip()
-                
-                # Look for the start of the items section
-                if re.search(r'Pos\s+Article\s+Description\s+Quantity\s+Price', line_clean, re.IGNORECASE):
-                    in_items_section = True
-                    continue
-                
-                if not in_items_section:
-                    continue
-                
-                # Skip header lines and "carried over" lines
-                if (re.search(r'Pos\s+Article|carried over|to be carried over', line_clean, re.IGNORECASE) or
-                    line_clean == 'EUR'):
-                    continue
-                
-                # Skip ONLY the very first Orderconfirmation line (header)
-                if re.match(r'^\d+\s+Orderconfirmation', line_clean) and not found_first_orderconfirmation:
-                    found_first_orderconfirmation = True
-                    continue
-                
-                # Look for record start: "your Ref.:"
-                if re.search(r'your Ref\.:', line_clean, re.IGNORECASE):
-                    if current_block and in_record:
-                        item_blocks.append((current_block, invoice_data.copy()))
-                    current_block = [line_clean]
-                    in_record = True
-                
-                # Continue collecting lines if we're in a record
-                elif in_record and current_block:
-                    # Stop if we hit summary lines
-                    if re.search(r'Value of goods|Packing|Energy|total EUR|payment:', line_clean, re.IGNORECASE):
-                        item_blocks.append((current_block, invoice_data.copy()))
-                        current_block = []
-                        in_record = False
-                    else:
-                        current_block.append(line_clean)
-            
-            if current_block and in_record:
-                item_blocks.append((current_block, invoice_data.copy()))
-            
-            # Process each item block
-            for block, inv_data in item_blocks:
-                item_data = _parse_josef_betzler_item_block(block, inv_data, page_num)
+            for item_data in item_blocks:
                 if item_data:
                     extracted_data.append(item_data)
     
     return extracted_data
+
+def _find_josef_betzler_items_directly(lines: List[str], invoice_data: Dict, page_num: int) -> List[Dict]:
+    """Find items directly by scanning for JB- patterns"""
+    items = []
+    current_order_info = {'order_no': invoice_data.get('order_no', ''), 
+                         'order_date': invoice_data.get('order_date', '')}
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        # Look for Orderconfirmation to update order info
+        if 'Orderconfirmation' in line and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            order_match = re.search(r'Your order\s+([^\s]+)\s+dtd\.\s+(\d{2}\.\d{2}\.\d{4})', next_line, re.IGNORECASE)
+            if order_match:
+                current_order_info = {
+                    'order_no': order_match.group(1),
+                    'order_date': order_match.group(2)
+                }
+                i += 2  # Skip both lines
+                continue
+        
+        # Look for your Ref.: lines followed by JB- items
+        if 'your Ref.:' in line and i + 1 < len(lines):
+            # Extract customer reference
+            ref_match = re.search(r'your Ref\.:\s*([^\s]+)', line, re.IGNORECASE)
+            customer_ref = ref_match.group(1) if ref_match else None
+            
+            # Check next line for JB- pattern
+            next_line = lines[i + 1].strip()
+            if 'JB-' in next_line:
+                # This is an item - collect the item block
+                item_block = [line, next_line]
+                
+                # Collect subsequent lines that belong to this item
+                j = i + 2
+                while j < len(lines):
+                    next_line_text = lines[j].strip()
+                    # Stop if we hit another item marker or end of section
+                    if (not next_line_text or 
+                        'your Ref.:' in next_line_text or 
+                        'Orderconfirmation' in next_line_text or
+                        'Value of goods' in next_line_text or
+                        'page' in next_line_text):
+                        break
+                    item_block.append(next_line_text)
+                    j += 1
+                
+                # Parse the item block
+                item_data = _parse_josef_betzler_item_simple(item_block, invoice_data, current_order_info, customer_ref, page_num)
+                if item_data:
+                    items.append(item_data)
+                
+                i = j  # Move to the next position
+                continue
+        
+        i += 1
+    
+    return items
+
+def _parse_josef_betzler_item_simple(block: List[str], invoice_data: Dict, order_info: Dict, customer_ref: str, page_num: int) -> Optional[Dict]:
+    """Simple parsing of Josef Betzler item"""
+    if len(block) < 2:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'order_no': order_info.get('order_no', ''),
+        'order_date': order_info.get('order_date', ''),
+        'delivery_note': invoice_data.get('delivery_note', ''),
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot': '',
+        'page': page_num + 1
+    }
+    
+    # The second line should contain the item data
+    item_line = block[1].strip()
+    
+    # Parse item line: "2 JB-4665-30 Henly Cartoid Retractor, 16 cm, 6 1/2´´, 2 ea 129,90 259,80"
+    # Try multiple patterns
+    patterns = [
+        r'(\d+)\s+(JB-\d+-\d+)\s+(.+?)\s+(\d+)\s+ea\s+([\d,]+)\s+[\d,]+',
+        r'(JB-\d+-\d+)\s+(.+?)\s+(\d+)\s+ea\s+([\d,]+)\s+[\d,]+',
+        r'(\d+)\s+(JB-\d+-\d+)\s+(.+?)\s+(\d+)\s+ea\s+([\d,]+)',
+        r'(JB-\d+-\d+)\s+(.+?)\s+(\d+)\s+ea\s+([\d,]+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, item_line)
+        if match:
+            groups = match.groups()
+            if len(groups) == 5:  # With position number
+                item_data['item_code'] = groups[1]
+                item_data['description'] = groups[2].strip()
+                item_data['quantity'] = groups[3]
+                item_data['unit_price'] = groups[4].replace(',', '.')
+            elif len(groups) == 4:  # Without position number
+                item_data['item_code'] = groups[0]
+                item_data['description'] = groups[1].strip()
+                item_data['quantity'] = groups[2]
+                item_data['unit_price'] = groups[3].replace(',', '.')
+            break
+    
+    # If regex failed, try simple string parsing
+    if not item_data['item_code'] and 'JB-' in item_line:
+        parts = item_line.split()
+        for j, part in enumerate(parts):
+            if part.startswith('JB-'):
+                item_data['item_code'] = part
+                # Try to find quantity and price
+                for k in range(j+1, len(parts)):
+                    if parts[k] == 'ea' and k > 0 and k + 1 < len(parts):
+                        item_data['quantity'] = parts[k-1]
+                        # Get price (remove comma)
+                        price_str = parts[k+1].replace(',', '.')
+                        if re.match(r'^\d+\.?\d*$', price_str):
+                            item_data['unit_price'] = price_str
+                        # Description is everything between JB- code and quantity
+                        desc_start = item_line.find(part) + len(part)
+                        desc_end = item_line.find(parts[k-1])
+                        item_data['description'] = item_line[desc_start:desc_end].strip()
+                        break
+                break
+    
+    # Extract metadata from the block
+    for line in block:
+        # LST number
+        lst_match = re.search(r'LST\s*([A-Z]\d+)', line, re.IGNORECASE)
+        if lst_match:
+            lst_no = lst_match.group(1)
+            if lst_no and item_data['description']:
+                item_data['description'] += f" (LST: {lst_no})"
+        
+        # Charge (lot number)
+        charge_match = re.search(r'Charge:\s*([^\s]+)', line, re.IGNORECASE)
+        if charge_match and not item_data['lot']:
+            item_data['lot'] = charge_match.group(1)
+        
+        # Classification
+        class_match = re.search(r'Classification:\s*([^\s]+)', line, re.IGNORECASE)
+        if class_match:
+            class_no = class_match.group(1)
+            if class_no and item_data['description']:
+                item_data['description'] += f" (Class: {class_no})"
+        
+        # Quantity from Charge line
+        qty_match = re.search(r'Quantity:\s*(\d+)', line, re.IGNORECASE)
+        if qty_match:
+            item_data['quantity'] = qty_match.group(1)
+    
+    # Add customer reference to description
+    if customer_ref and item_data['description']:
+        item_data['description'] = f"{customer_ref} - {item_data['description']}"
+    
+    # Add description continuation (lines after the item line that don't contain metadata)
+    desc_lines = []
+    for k in range(2, len(block)):
+        line_text = block[k].strip()
+        if (line_text and 
+            not re.search(r'LST|Charge:|Classification:|Quantity:', line_text, re.IGNORECASE) and
+            len(line_text) > 3 and
+            re.match(r'^[a-zA-Z]', line_text)):
+            desc_lines.append(line_text)
+    
+    if desc_lines:
+        continuation = ' '.join(desc_lines)
+        if continuation and item_data['description']:
+            item_data['description'] += ' - ' + continuation
+    
+    # Only return if we have essential data
+    if item_data['item_code'] and item_data['description'] and item_data['quantity']:
+        return item_data
+    
+    return None
 
 def _extract_josef_betzler_invoice_info(lines: List[str]) -> Dict[str, str]:
     """Extract invoice information from Josef Betzler invoice"""
@@ -7439,8 +7572,1535 @@ def _extract_josef_betzler_invoice_info(lines: List[str]) -> Dict[str, str]:
     
     return invoice_data
 
-def _parse_josef_betzler_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
-    """Parse an individual item block from Josef Betzler invoice"""
+
+#KAPP
+def extract_kapp_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from KAPP invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_kapp_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            current_order_info = {'order_no': '', 'order_date': ''}
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if re.search(r'POS\.\s+ARTICLE\s+description\s+qty\.\s+each\s+price', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Skip header lines
+                if re.search(r'POS\.\s+ARTICLE|total net|package|total/EUR', line_clean, re.IGNORECASE):
+                    continue
+                
+                # Look for order information
+                order_match = re.search(r'your order no\.\s*([^\s-]+)\s*-\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+                if order_match:
+                    current_order_info = {
+                        'order_no': order_match.group(1),
+                        'order_date': order_match.group(2)
+                    }
+                    continue
+                
+                # Look for lines that start with position numbers followed by item codes
+                if re.match(r'^\d+\s+[A-Z]\d+', line_clean):  # e.g., "1 N6833-07"
+                    if current_block and in_items_section:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_info.copy()))
+                    current_block = [line_clean]
+                
+                # Continue collecting lines for the current item
+                elif current_block:
+                    # Stop if we hit a new item or summary section
+                    if (re.match(r'^\d+\s+[A-Z]\d+', line_clean) or
+                        re.search(r'total net|package|total/EUR|payment:|delivery terms', line_clean, re.IGNORECASE)):
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_info.copy()))
+                        current_block = [line_clean] if re.match(r'^\d+\s+[A-Z]\d+', line_clean) else []
+                    else:
+                        current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy(), current_order_info.copy()))
+            
+            # Process each item block
+            for block, inv_data, order_info in item_blocks:
+                item_data = _parse_kapp_item_block(block, inv_data, order_info, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_kapp_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from KAPP invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'order_no': '',
+        'order_date': '',
+        'delivery_note': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number
+        inv_match = re.search(r'COMMERCIAL INVOICE\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if inv_match and not invoice_data['invoice_number']:
+            invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Extract invoice date
+        date_match = re.search(r'Date\s*:\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if date_match and not invoice_data['invoice_date']:
+            invoice_data['invoice_date'] = date_match.group(1)
+        
+        # Extract customer number
+        cust_match = re.search(r'Cust\.-No\.\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if cust_match and not invoice_data['customer_number']:
+            invoice_data['customer_number'] = cust_match.group(1)
+        
+        # Extract delivery note
+        delivery_match = re.search(r'Delivery Note No\.\s*(\d+)\s*dt\.\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if delivery_match and not invoice_data['delivery_note']:
+            invoice_data['delivery_note'] = delivery_match.group(1)
+    
+    return invoice_data
+
+def _parse_kapp_item_block(block: List[str], invoice_data: Dict, order_info: Dict, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from KAPP invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'order_no': order_info.get('order_no', ''),
+        'order_date': order_info.get('order_date', ''),
+        'delivery_note': invoice_data.get('delivery_note', ''),
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot': '',
+        'page': page_num + 1
+    }
+    
+    # The first line should contain the main item data
+    first_line = block[0].strip()
+    
+    # Extract position number (remove it since we don't need it)
+    pos_match = re.search(r'^(\d+)\s+', first_line)
+    if pos_match:
+        first_line = first_line[len(pos_match.group(0)):].strip()
+    
+    # Extract item code, description, quantity, unit price
+    # Pattern: "N6833-07 Oldberg rongeur,straight, 18 cm ,6 mm 3 137,21 411,63"
+    item_match = re.search(r'^([A-Z]\d+-\d+)\s+(.+?)\s+(\d+)\s+([\d,]+)\s+[\d,]+$', first_line)
+    
+    if item_match:
+        item_data['item_code'] = item_match.group(1).strip()
+        item_data['description'] = item_match.group(2).strip()
+        item_data['quantity'] = item_match.group(3)
+        item_data['unit_price'] = item_match.group(4).replace(',', '.')
+    
+    # Alternative pattern for different formatting
+    if not item_data['item_code']:
+        alt_match = re.search(r'^([A-Z]\d+-\d+)\s+(.+?)\s+(\d+)\s+([\d,]+)', first_line)
+        if alt_match:
+            item_data['item_code'] = alt_match.group(1).strip()
+            item_data['description'] = alt_match.group(2).strip()
+            item_data['quantity'] = alt_match.group(3)
+            item_data['unit_price'] = alt_match.group(4).replace(',', '.')
+    
+    # Extract metadata from the entire block
+    for line in block:
+        # Lot number
+        lot_match = re.search(r'lot number:\s*([^\s]+)', line, re.IGNORECASE)
+        if lot_match and not item_data['lot']:
+            item_data['lot'] = lot_match.group(1)
+        
+        # Device Listing
+        device_match = re.search(r'Device Listing:\s*([^\s]+)', line, re.IGNORECASE)
+        if device_match:
+            device_no = device_match.group(1)
+            if device_no and item_data['description']:
+                item_data['description'] += f" (Device: {device_no})"
+        
+        # Our item number
+        our_item_match = re.search(r'Our item-no\.\s*([^\s]+)', line, re.IGNORECASE)
+        if our_item_match:
+            our_item_no = our_item_match.group(1)
+            if our_item_no and item_data['description']:
+                item_data['description'] += f" (Our Item: {our_item_no})"
+    
+    # For multi-line descriptions, combine them
+    if len(block) > 1 and item_data['description']:
+        additional_desc = []
+        for line in block[1:]:
+            # Only include lines that don't look like metadata
+            if not re.search(r'lot number:|Device Listing:|Our item-no:', line, re.IGNORECASE):
+                clean_line = line.strip()
+                if clean_line and not re.match(r'^\d+\s+[A-Z]\d+', clean_line):  # Don't include lines that start like new items
+                    # Check if this line contains additional description
+                    if re.match(r'^[a-zA-Z]', clean_line):  # Starts with a letter
+                        additional_desc.append(clean_line)
+        
+        if additional_desc:
+            item_data['description'] += ' - ' + ' '.join(additional_desc)
+    
+    # Extract unit price from alternative patterns if still missing
+    if not item_data['unit_price']:
+        prices = re.findall(r'\b(\d+[,.]\d{2})\b', first_line)
+        if len(prices) >= 2:  # Usually there are two prices: unit price and total
+            item_data['unit_price'] = prices[0].replace(',', '.')  # First price is unit price
+    
+    # Extract quantity from alternative patterns if still missing
+    if not item_data['quantity']:
+        # Look for numbers that are likely quantities (not prices)
+        numbers = re.findall(r'\b(\d+)\b', first_line)
+        if len(numbers) >= 2:
+            # The number before the prices is likely the quantity
+            for i, num in enumerate(numbers):
+                if i < len(numbers) - 1 and re.search(r'\d+[,.]\d{2}', first_line.split(num)[-1]):
+                    item_data['quantity'] = num
+                    break
+    
+    # Only return if we have at least description and quantity
+    if item_data['description'] and item_data['quantity']:
+        return item_data
+    
+    return None
+
+
+#Kohler
+def extract_kohler_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Kohler invoice format (both Proforma and regular invoices).
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_kohler_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            current_order_info = {'order_no': '', 'order_date': ''}
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section (different headers for Proforma vs regular)
+                if (re.search(r'Pos\.\s+Ref\.\s+Description\s+Kat\.\s+Qty\.\s+Unit\s+Price\s+Total', line_clean, re.IGNORECASE) or
+                    re.search(r'Pos\.\s+Ref\.\s+Description\s+Qty\.\s+Unit\s+Price\s+Total', line_clean, re.IGNORECASE)):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Skip header lines and summary lines
+                if (re.search(r'Pos\.\s+Ref\.|total net|package|Total/EUR|Payment|Delivery|Terms of delivery', line_clean, re.IGNORECASE) or
+                    line_clean == 'Kat. Qty. Unit Price Total' or
+                    line_clean == 'Qty. Unit Price Total'):
+                    continue
+                
+                # Look for order information
+                order_match = re.search(r'your order no\.\s*([^\s-]+)\s*-\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+                if order_match:
+                    current_order_info = {
+                        'order_no': order_match.group(1),
+                        'order_date': order_match.group(2)
+                    }
+                    continue
+                
+                # Look for lines that start with position numbers followed by references
+                if re.match(r'^\d+\s+\d+', line_clean):  # e.g., "1 8131" or "1 8179"
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_info.copy()))
+                    current_block = [line_clean]
+                
+                # Continue collecting lines for the current item
+                elif current_block:
+                    # Stop if we hit a new item or summary section
+                    if (re.match(r'^\d+\s+\d+', line_clean) or
+                        re.search(r'total net|package|Total/EUR|Payment|Delivery|Terms of delivery', line_clean, re.IGNORECASE)):
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_info.copy()))
+                        current_block = [line_clean] if re.match(r'^\d+\s+\d+', line_clean) else []
+                    else:
+                        current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy(), current_order_info.copy()))
+            
+            # Process each item block
+            for block, inv_data, order_info in item_blocks:
+                item_data = _parse_kohler_item_block(block, inv_data, order_info, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_kohler_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Kohler invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'order_no': '',
+        'order_date': '',
+        'delivery_note': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number (both PROFORMA INVOICE and regular INVOICE)
+        inv_match = re.search(r'(?:PROFORMA\s+INVOICE|INVOICE)\s+NO\.?\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if inv_match and not invoice_data['invoice_number']:
+            invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Extract invoice date
+        date_match = re.search(r'Date\s*:\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if date_match and not invoice_data['invoice_date']:
+            invoice_data['invoice_date'] = date_match.group(1)
+        
+        # Extract customer number
+        cust_match = re.search(r'Customer No\.?\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if cust_match and not invoice_data['customer_number']:
+            invoice_data['customer_number'] = cust_match.group(1)
+        
+        # Extract delivery note
+        delivery_match = re.search(r'Delivery Note No\.?\s*(\d+)\s*of\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if delivery_match and not invoice_data['delivery_note']:
+            invoice_data['delivery_note'] = delivery_match.group(1)
+        
+        # Extract valid until date for Proforma invoices
+        valid_match = re.search(r'Valid until\s*:\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if valid_match:
+            # Use valid until date as order date for Proforma invoices if no other date is found
+            if not invoice_data['order_date']:
+                invoice_data['order_date'] = valid_match.group(1)
+    
+    return invoice_data
+
+def _parse_kohler_item_block(block: List[str], invoice_data: Dict, order_info: Dict, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Kohler invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'order_no': order_info.get('order_no', ''),
+        'order_date': order_info.get('order_date', ''),
+        'delivery_note': invoice_data.get('delivery_note', ''),
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot': '',
+        'page': page_num + 1
+    }
+    
+    # The first line should contain the main item data
+    first_line = block[0].strip()
+    
+    # Extract position number and reference (remove them since we don't need them)
+    pos_match = re.search(r'^(\d+)\s+(\d+)\s+', first_line)
+    if pos_match:
+        # Remove the position number and reference from the line for easier parsing
+        first_line = first_line[len(pos_match.group(0)):].strip()
+    
+    # Extract description, quantity, unit price
+    # Pattern: "Mouth prop MCKESSON, for adults, large 5 20,49 102,45"
+    # or: "ERICH Arch Bar 20 26,00 520,00"
+    item_match = re.search(r'^(.+?)\s+(\d+)\s+([\d,]+)\s+[\d,]+$', first_line)
+    
+    if item_match:
+        item_data['description'] = item_match.group(1).strip()
+        item_data['quantity'] = item_match.group(2)
+        item_data['unit_price'] = item_match.group(3).replace(',', '.')
+    
+    # Alternative pattern for different formatting
+    if not item_data['description']:
+        alt_match = re.search(r'^(.+?)\s+(\d+)\s+([\d,]+)', first_line)
+        if alt_match:
+            item_data['description'] = alt_match.group(1).strip()
+            item_data['quantity'] = alt_match.group(2)
+            item_data['unit_price'] = alt_match.group(3).replace(',', '.')
+    
+    # Extract metadata from the entire block
+    ref_no = None
+    for line in block:
+        # Reference number
+        ref_match = re.search(r'Ref-No\.:\s*([^\s]+)', line, re.IGNORECASE)
+        if ref_match:
+            ref_no = ref_match.group(1)
+        
+        # LST number
+        lst_match = re.search(r'LST:\s*([^\s]+)', line, re.IGNORECASE)
+        if lst_match:
+            lst_no = lst_match.group(1)
+            if lst_no and item_data['description']:
+                item_data['description'] += f" (LST: {lst_no})"
+        
+        # Lot number
+        lot_match = re.search(r'Lot number\s*(\d+)', line, re.IGNORECASE)
+        if lot_match and not item_data['lot']:
+            item_data['lot'] = lot_match.group(1)
+    
+    # Add reference number to description if found
+    if ref_no and item_data['description']:
+        item_data['description'] = f"{ref_no} - {item_data['description']}"
+        item_data['item_code'] = ref_no  # Use Ref-No as item code
+    
+    # For multi-line descriptions, combine them
+    if len(block) > 1 and item_data['description']:
+        additional_desc = []
+        for line in block[1:]:
+            # Only include lines that don't look like metadata
+            if not re.search(r'Ref-No\.:|LST:|Lot number', line, re.IGNORECASE):
+                clean_line = line.strip()
+                if clean_line and not re.match(r'^\d+\s+\d+', clean_line):  # Don't include lines that start like new items
+                    # Check if this line contains additional description (like "- by pairs - black")
+                    if re.match(r'^[a-zA-Z\-]', clean_line):  # Starts with a letter or hyphen
+                        additional_desc.append(clean_line)
+        
+        if additional_desc:
+            item_data['description'] += ' - ' + ' '.join(additional_desc)
+    
+    # Extract unit price from alternative patterns if still missing
+    if not item_data['unit_price']:
+        prices = re.findall(r'\b(\d+[,.]\d{2})\b', first_line)
+        if len(prices) >= 2:  # Usually there are two prices: unit price and total
+            item_data['unit_price'] = prices[0].replace(',', '.')  # First price is unit price
+    
+    # Extract quantity from alternative patterns if still missing
+    if not item_data['quantity']:
+        # Look for numbers that are likely quantities (not prices)
+        numbers = re.findall(r'\b(\d+)\b', first_line)
+        if len(numbers) >= 2:
+            # The number before the prices is likely the quantity
+            for i, num in enumerate(numbers):
+                if i < len(numbers) - 1 and re.search(r'\d+[,.]\d{2}', first_line.split(num)[-1]):
+                    item_data['quantity'] = num
+                    break
+    
+    # Only return if we have at least description and quantity
+    if item_data['description'] and item_data['quantity']:
+        return item_data
+    
+    return None
+
+
+#Max Hauser OCR needed
+
+#MedChain Supply OCR Needed
+
+#Medin
+def extract_medin_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Medin invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_medin_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if 'Ordered Shipped Description Tax Unit Price Amount' in line_clean:
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Skip empty lines and header repetitions
+                if not line_clean or 'Ordered Shipped' in line_clean:
+                    continue
+                
+                # Look for item lines (they start with numbers for ordered/shipped quantities)
+                if re.match(r'^\d+\s+\d+\s+[\w-]+\s+-\s+', line_clean):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = [line_clean]
+                # Look for customer information lines that belong to the current item
+                elif current_block and re.search(r'Customer Order|Customer PO|Customer Part ID', line_clean):
+                    current_block.append(line_clean)
+                # Stop when we hit summary sections
+                elif re.search(r'Terms Summary|Sub Total|Returned Goods Policy', line_clean):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = []
+                    break
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy()))
+            
+            # Process each item block
+            for block, inv_data in item_blocks:
+                item_data = _parse_medin_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_medin_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Medin invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',  # This will be extracted from Customer Part ID
+        'order_no': '',
+        'order_date': '',
+        'delivery_note': ''
+    }
+    
+    for i, line in enumerate(lines):
+        line_clean = line.strip()
+        
+        # Extract invoice number - it's on the line after "Invoice"
+        if line_clean == 'Invoice' and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            if next_line.isdigit():  # Invoice number is just digits
+                invoice_data['invoice_number'] = next_line
+        
+        # Extract invoice date - US format M/D/YYYY
+        date_match = re.search(r'Invoice Date\s+(\d{1,2}/\d{1,2}/\d{4})', line_clean)
+        if date_match and not invoice_data['invoice_date']:
+            us_date = date_match.group(1)
+            parts = us_date.split('/')
+            if len(parts) == 3:
+                invoice_data['invoice_date'] = f"{parts[1]}.{parts[0]}.{parts[2]}"
+        
+        # Extract customer number from Customer Part ID (e.g., "9394-11")
+        part_id_match = re.search(r'Customer Part ID:\s*([^\s]+)', line_clean)
+        if part_id_match:
+            invoice_data['customer_number'] = part_id_match.group(1)
+        
+        # Extract order information
+        if 'Customer Order' in line_clean:
+            # Pattern: "Customer Order SO-126507 Order Date OrderDate"
+            order_match = re.search(r'Customer Order\s+([^\s]+)', line_clean)
+            if order_match and not invoice_data['order_no']:
+                invoice_data['order_no'] = order_match.group(1)
+        
+        # Extract customer PO
+        po_match = re.search(r'Customer PO\s+([^\s]+)', line_clean)
+        if po_match and not invoice_data['order_no']:
+            invoice_data['order_no'] = po_match.group(1)
+        
+        # Extract packing slip (delivery note)
+        packing_match = re.search(r'Packing Slip\s+([^\s]+)', line_clean)
+        if packing_match and not invoice_data['delivery_note']:
+            invoice_data['delivery_note'] = packing_match.group(1)
+    
+    return invoice_data
+
+def _parse_medin_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Medin invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],  # From Customer Part ID
+        'order_no': invoice_data.get('order_no', ''),
+        'order_date': invoice_data.get('order_date', ''),
+        'delivery_note': invoice_data.get('delivery_note', ''),
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot': '',
+        'page': page_num + 1
+    }
+    
+    # The first line contains the main item data
+    first_line = block[0].strip()
+    
+    # Parse: "1 5 20-1321 - 20.25X13X3.5 UNLIDDED STER TRY 133.0000 665.00"
+    # This means: Ordered=1, Shipped=5, ItemCode=20-1321, Description=20.25X13X3.5 UNLIDDED STER TRY, UnitPrice=133.0000, Amount=665.00
+    
+    item_match = re.search(r'^(\d+)\s+(\d+)\s+([\w-]+)\s+-\s+(.+?)\s+([\d,]+\.\d{4})\s+([\d,]+\.\d{2})$', first_line)
+    
+    if item_match:
+        ordered_qty = item_match.group(1)  # Ordered quantity
+        shipped_qty = item_match.group(2)  # Shipped quantity (this is what we use)
+        item_data['item_code'] = item_match.group(3)
+        item_data['description'] = item_match.group(4).strip()
+        item_data['unit_price'] = item_match.group(5).replace(',', '')  # Remove commas
+        item_data['quantity'] = shipped_qty  # Use shipped quantity as the actual quantity
+        
+        # Add ordered quantity to description for reference
+        item_data['description'] += f" (Ordered: {ordered_qty}, Shipped: {shipped_qty})"
+    
+    # If the detailed pattern fails, try a simpler approach
+    if not item_data['item_code']:
+        # Split by spaces and try to identify components
+        parts = first_line.split()
+        if len(parts) >= 7:
+            # Look for the pattern: number number code-with-dash dash description price price
+            for i in range(len(parts) - 3):
+                if (parts[i].isdigit() and 
+                    parts[i+1].isdigit() and 
+                    '-' in parts[i+2] and 
+                    parts[i+3] == '-'):
+                    # Found the pattern structure
+                    item_data['quantity'] = parts[i+1]  # Shipped quantity
+                    item_data['item_code'] = parts[i+2]
+                    # Description is everything between the dash and the prices
+                    desc_start = first_line.find(parts[i+3]) + len(parts[i+3]) + 1
+                    # Find where prices start (look for decimal numbers)
+                    for j in range(i+4, len(parts)):
+                        if '.' in parts[j]:
+                            desc_end = first_line.find(parts[j])
+                            item_data['description'] = first_line[desc_start:desc_end].strip()
+                            # The first price is unit price
+                            item_data['unit_price'] = parts[j].replace(',', '')
+                            break
+                    break
+    
+    # Extract additional metadata from the block
+    customer_part_id = None
+    for line in block:
+        # Customer Part ID (this is actually the customer number for Medin)
+        part_match = re.search(r'Customer Part ID:\s*([^\s]+)', line, re.IGNORECASE)
+        if part_match:
+            customer_part_id = part_match.group(1)
+            # Update customer number if not already set
+            if not item_data['customer_number']:
+                item_data['customer_number'] = customer_part_id
+        
+        # Additional order information if not already captured
+        order_match = re.search(r'Customer Order\s+([^\s]+)', line, re.IGNORECASE)
+        if order_match and not item_data['order_no']:
+            item_data['order_no'] = order_match.group(1)
+        
+        po_match = re.search(r'Customer PO\s+([^\s]+)', line, re.IGNORECASE)
+        if po_match and not item_data['order_no']:
+            item_data['order_no'] = po_match.group(1)
+    
+    # Add Customer Part ID to description if different from customer number
+    if customer_part_id and item_data['description'] and customer_part_id != item_data['customer_number']:
+        item_data['description'] += f" (Part ID: {customer_part_id})"
+    
+    # Normalize unit price to 2 decimal places
+    if item_data['unit_price']:
+        try:
+            price_float = float(item_data['unit_price'])
+            item_data['unit_price'] = f"{price_float:.2f}"
+        except ValueError:
+            pass
+    
+    # Only return if we have essential data
+    if item_data['item_code'] and item_data['description'] and item_data['quantity']:
+        return item_data
+    
+    return None
+
+
+#Microqore
+def extract_microqore_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Microqore invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_microqore_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            current_delivery_info = {'order_no': '', 'order_date': '', 'delivery_note': ''}
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if re.search(r'POS\s+Item\s+No\.\s+Desc\.\s+Quantity\s+each\s+Total', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Skip header lines and empty lines
+                if not line_clean or re.search(r'POS\s+Item\s+No\.|EUR\s+EUR', line_clean, re.IGNORECASE):
+                    continue
+                
+                # Look for delivery information - this contains order number and date
+                delivery_match = re.search(r'Delivery(\d+)\s*/\s*\d+\s+from\s+(\d{2}\.\d{2}\.\d{4})', line_clean)
+                if delivery_match:
+                    current_delivery_info['order_no'] = delivery_match.group(1)  # 303861
+                    current_delivery_info['order_date'] = delivery_match.group(2)  # 17.09.2024
+                    current_delivery_info['delivery_note'] = delivery_match.group(1)  # Use as delivery note too
+                    continue
+                
+                # Look for order information (alternative)
+                order_match = re.search(r'Your Order No\.\s*([^\s]+)', line_clean, re.IGNORECASE)
+                if order_match:
+                    current_delivery_info['order_no'] = order_match.group(1)
+                    continue
+                
+                # Look for item lines (start with numbers followed by MQ4- codes)
+                if re.match(r'^\d+\s+MQ4-', line_clean):  # e.g., "10 MQ4-4060-21TC-C"
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_delivery_info.copy()))
+                    current_block = [line_clean]
+                
+                # Continue collecting lines for the current item
+                elif current_block:
+                    # Stop if we hit a new item, delivery info, or summary section
+                    if (re.match(r'^\d+\s+MQ4-', line_clean) or
+                        re.search(r'Delivery\d+', line_clean) or
+                        re.search(r'Line Value|Packing costs|Gross|Steuerfreie', line_clean, re.IGNORECASE)):
+                        item_blocks.append((current_block, invoice_data.copy(), current_delivery_info.copy()))
+                        current_block = [line_clean] if re.match(r'^\d+\s+MQ4-', line_clean) else []
+                    else:
+                        current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy(), current_delivery_info.copy()))
+            
+            # Process each item block
+            for block, inv_data, delivery_info in item_blocks:
+                item_data = _parse_microqore_item_block(block, inv_data, delivery_info, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_microqore_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Microqore invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'order_no': '',
+        'order_date': '',
+        'delivery_note': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number and date from the header line
+        # Pattern: "20240666 17.09.2024 MW 50103 1"
+        header_match = re.search(r'^(\d+)\s+(\d{2}\.\d{2}\.\d{4})\s+\w+\s+(\d+)\s+\d+$', line_clean)
+        if header_match:
+            if not invoice_data['invoice_number']:
+                invoice_data['invoice_number'] = header_match.group(1)
+            if not invoice_data['invoice_date']:
+                invoice_data['invoice_date'] = header_match.group(2)
+            if not invoice_data['customer_number']:
+                invoice_data['customer_number'] = header_match.group(3)
+        
+        # Alternative pattern for invoice number and date
+        if not invoice_data['invoice_number']:
+            inv_match = re.search(r'INVOICE\s+(\d+)\s+(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+            if inv_match:
+                invoice_data['invoice_number'] = inv_match.group(1)
+                invoice_data['invoice_date'] = inv_match.group(2)
+        
+        # Extract customer number
+        cust_match = re.search(r'Customer No\.\s*(\d+)', line_clean, re.IGNORECASE)
+        if cust_match and not invoice_data['customer_number']:
+            invoice_data['customer_number'] = cust_match.group(1)
+    
+    return invoice_data
+
+def _parse_microqore_item_block(block: List[str], invoice_data: Dict, delivery_info: Dict, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Microqore invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'order_no': delivery_info.get('order_no', invoice_data.get('order_no', '')),
+        'order_date': delivery_info.get('order_date', invoice_data.get('order_date', '')),
+        'delivery_note': delivery_info.get('delivery_note', invoice_data.get('delivery_note', '')),
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot': '',
+        'page': page_num + 1
+    }
+    
+    # The first line should contain the main item data
+    first_line = block[0].strip()
+    
+    # Parse the item line: "10 MQ4-4060-21TC-C castroviejo needle holder, tungsten carbide 15pieces"
+    # The unit price is on the next line: "110,75 1.661,25"
+    item_match = re.search(r'^(\d+)\s+(MQ4-\S+)\s+(.+?)\s+(\d+)pieces$', first_line)
+    
+    if item_match:
+        item_data['quantity'] = item_match.group(4)  # Quantity from "15pieces"
+        item_data['item_code'] = item_match.group(2)
+        item_data['description'] = item_match.group(3).strip()
+    
+    # If the first pattern fails, try a more flexible approach
+    if not item_data['item_code']:
+        parts = first_line.split()
+        if len(parts) >= 3:
+            # Look for MQ4- pattern
+            for i, part in enumerate(parts):
+                if part.startswith('MQ4-') and i > 0 and i + 1 < len(parts):
+                    # Previous part should be the first number, look for "pieces"
+                    if parts[i-1].isdigit():
+                        # Find where "pieces" appears
+                        for j in range(i+1, len(parts)):
+                            if 'pieces' in parts[j]:
+                                # Extract quantity from the pieces word
+                                qty_match = re.search(r'(\d+)pieces', parts[j])
+                                if qty_match:
+                                    item_data['quantity'] = qty_match.group(1)
+                                # Description is everything between MQ4 code and pieces
+                                desc_start = first_line.find(part) + len(part) + 1
+                                desc_end = first_line.find(parts[j])
+                                item_data['description'] = first_line[desc_start:desc_end].strip()
+                                item_data['item_code'] = part
+                                break
+                        break
+    
+    # Look for unit price in the next line(s)
+    for i in range(1, len(block)):
+        line = block[i].strip()
+        # Look for price pattern: "110,75 1.661,25"
+        price_match = re.search(r'^([\d,]+)\s+[\d,\.]+$', line)
+        if price_match:
+            item_data['unit_price'] = price_match.group(1).replace(',', '.')
+            break
+    
+    # If still no unit price found, check the first line again
+    if not item_data['unit_price']:
+        # Maybe the prices are on the same line
+        price_match = re.search(r'(\d+)pieces\s+([\d,]+)\s+[\d,\.]+', first_line)
+        if price_match:
+            item_data['quantity'] = price_match.group(1)
+            item_data['unit_price'] = price_match.group(2).replace(',', '.')
+    
+    # Extract metadata from the entire block
+    drawing_no = None
+    for line in block:
+        # Drawing number
+        drawing_match = re.search(r'Drawing\s+([^\s]+)', line, re.IGNORECASE)
+        if drawing_match:
+            drawing_no = drawing_match.group(1)
+        
+        # Lot information
+        lot_match = re.search(r'Lot(\d+)\s+Lot-Code(\w+)', line, re.IGNORECASE)
+        if lot_match:
+            lot_number = lot_match.group(1)
+            lot_code = lot_match.group(2)
+            item_data['lot'] = f"{lot_number}-{lot_code}"
+        
+        # Alternative lot pattern
+        if not item_data['lot']:
+            alt_lot_match = re.search(r'(\d+)\s+x\s+Lot(\d+)\s+Lot-Code(\w+)', line, re.IGNORECASE)
+            if alt_lot_match:
+                lot_qty = alt_lot_match.group(1)
+                lot_number = alt_lot_match.group(2)
+                lot_code = alt_lot_match.group(3)
+                item_data['lot'] = f"{lot_number}-{lot_code}"
+                # Add lot quantity to description
+                if item_data['description']:
+                    item_data['description'] += f" (Lot Qty: {lot_qty})"
+        
+        # Customer reference numbers (like G4355-31, C6638-39)
+        ref_match = re.search(r'\(([A-Z]\d+-\d+)\)', line)
+        if ref_match:
+            ref_no = ref_match.group(1)
+            if ref_no and item_data['description']:
+                item_data['description'] += f" (Ref: {ref_no})"
+    
+    # Add drawing number to description if found
+    if drawing_no and item_data['description']:
+        item_data['description'] += f" (Drawing: {drawing_no})"
+    
+    # For multi-line descriptions, combine them
+    if len(block) > 1 and item_data['description']:
+        additional_desc = []
+        for i in range(1, len(block)):
+            line = block[i].strip()
+            # Skip lines that contain prices or metadata
+            if (line and 
+                not re.search(r'^\d+[,.]\d+\s+[\d,\.]+$', line) and  # Not a price line
+                not re.search(r'Drawing|Lot|Delivery|Line Value', line, re.IGNORECASE) and
+                not re.match(r'^\d+\s+MQ4-', line) and
+                re.match(r'^[a-zA-Z]', line)):  # Starts with a letter
+                additional_desc.append(line)
+        
+        if additional_desc:
+            item_data['description'] += ' - ' + ' '.join(additional_desc)
+    
+    # Only return if we have essential data
+    if item_data['description'] and item_data['quantity'] and item_data['unit_price']:
+        return item_data
+    
+    return None
+
+#NDC OCR Needed
+
+#Otto Ruttgers
+def extract_otto_ruttgers_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Otto Ruttgers invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_otto_ruttgers_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            current_order_info = {'order_no': '', 'order_date': ''}
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if re.search(r'POS\.ARTICLE\s+description\s+your order no\.\s+qty\.\s+each\s+price', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Skip header lines and summary lines
+                if (re.search(r'POS\.ARTICLE|carry-over|total net|package|freight|total/EUR', line_clean, re.IGNORECASE) or
+                    line_clean == 'description your order no. qty. each price'):
+                    continue
+                
+                # Look for order information
+                order_match = re.search(r'your order no\.\s*([^\s-]+)\s*-\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+                if order_match:
+                    current_order_info = {
+                        'order_no': order_match.group(1),
+                        'order_date': order_match.group(2)
+                    }
+                    # Start a new block for this order
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_info.copy()))
+                    current_block = []
+                    continue
+                
+                # Look for customer article number
+                art_match = re.search(r'your art\.-no\.:\s*([^\s;]+)', line_clean, re.IGNORECASE)
+                if art_match and current_block:
+                    # This continues the current item block
+                    current_block.append(line_clean)
+                    continue
+                
+                # Look for lines that start with position numbers followed by item codes
+                if re.match(r'^\d+\s+[A-Z]', line_clean):  # e.g., "1 HMIMCU-3K" or "1 HBPMCU-1015/3LRSurg"
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_info.copy()))
+                    current_block = [line_clean]
+                
+                # Look for lines that might be continuation of item descriptions (start with item codes)
+                elif re.match(r'^[A-Z][\w/-]+\s+', line_clean) and current_block:
+                    # This might be a continuation line for the current item
+                    current_block.append(line_clean)
+                
+                # Continue collecting lines for the current item (description continuations, LOT info, etc.)
+                elif current_block and line_clean:
+                    # Stop if we hit a new item or summary section
+                    if (re.match(r'^\d+\s+[A-Z]', line_clean) or
+                        re.search(r'carry-over|total net|package|freight|total/EUR', line_clean, re.IGNORECASE)):
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_info.copy()))
+                        current_block = [line_clean] if re.match(r'^\d+\s+[A-Z]', line_clean) else []
+                    else:
+                        # Only add if it looks like description continuation or metadata
+                        if (re.match(r'^[a-zA-Z]', line_clean) or  # Starts with letter
+                            re.search(r'LOT\s*\d+', line_clean, re.IGNORECASE) or  # Lot information
+                            re.search(r'your art\.-no\.:', line_clean, re.IGNORECASE)):  # Article number
+                            current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy(), current_order_info.copy()))
+            
+            # Process each item block
+            for block, inv_data, order_info in item_blocks:
+                item_data = _parse_otto_ruttgers_item_block(block, inv_data, order_info, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _parse_otto_ruttgers_item_block(block: List[str], invoice_data: Dict, order_info: Dict, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Otto Ruttgers invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'order_no': order_info.get('order_no', invoice_data.get('order_no', '')),
+        'order_date': order_info.get('order_date', invoice_data.get('order_date', '')),
+        'delivery_note': invoice_data.get('delivery_note', ''),
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot': '',
+        'page': page_num + 1
+    }
+    
+    # The first line should contain the main item data
+    first_line = block[0].strip()
+    
+    # Extract position number (remove it since we don't need it)
+    pos_match = re.search(r'^(\d+)\s+', first_line)
+    if pos_match:
+        first_line = first_line[len(pos_match.group(0)):].strip()
+    
+    # Try multiple patterns to handle different formats
+    
+    # Pattern 1: Standard format "HMIMCU-3K Surgical Scalpelhandle for mini 16186 200 St. 7,12 1.424,00"
+    item_match = re.search(r'^([A-Z][\w/-]+)\s+(.+?)\s+(\d+)\s+([^\s]+)\s+([\d,]+)\s+([\d,\.]+)$', first_line)
+    
+    if item_match:
+        item_data['item_code'] = item_match.group(1).strip()
+        item_data['description'] = item_match.group(2).strip()
+        item_data['quantity'] = item_match.group(3)
+        item_data['unit_price'] = item_match.group(5).replace(',', '.')
+    
+    # Pattern 2: Format with order number in description "HBPMCU-1015/3LRSurg. Scalpel handle EN 27740 No. 4200987135 300 pcs. 7,44 2.232,00"
+    if not item_data['item_code']:
+        alt_match = re.search(r'^([A-Z][\w/-]+)\s+(.+?)\s+No\.\s*\d+\s+(\d+)\s+([^\s]+)\s+([\d,]+)\s+([\d,\.]+)$', first_line)
+        if alt_match:
+            item_data['item_code'] = alt_match.group(1).strip()
+            item_data['description'] = alt_match.group(2).strip()
+            item_data['quantity'] = alt_match.group(3)
+            item_data['unit_price'] = alt_match.group(5).replace(',', '.')
+    
+    # Pattern 3: More flexible pattern
+    if not item_data['item_code']:
+        flex_match = re.search(r'^([A-Z][\w/-]+)\s+(.+?)\s+(\d+)\s+([^\s]+)\s+([\d,]+)', first_line)
+        if flex_match:
+            item_data['item_code'] = flex_match.group(1).strip()
+            item_data['description'] = flex_match.group(2).strip()
+            item_data['quantity'] = flex_match.group(3)
+            item_data['unit_price'] = flex_match.group(5).replace(',', '.')
+    
+    # Pattern 4: Even more flexible - just look for item code and prices
+    if not item_data['item_code']:
+        # Find the item code (starts with capital letter, contains letters/numbers/dashes/slashes)
+        code_match = re.search(r'([A-Z][\w/-]+)', first_line)
+        if code_match:
+            item_data['item_code'] = code_match.group(1)
+            # Try to find quantity and price
+            prices = re.findall(r'([\d,]+\.?\d{0,2})', first_line)
+            if len(prices) >= 2:
+                item_data['unit_price'] = prices[-2].replace(',', '.')  # Second last is unit price
+            # Find quantity (number before pcs., St., etc.)
+            qty_match = re.search(r'(\d+)\s+(pcs\.|St\.)', first_line, re.IGNORECASE)
+            if qty_match:
+                item_data['quantity'] = qty_match.group(1)
+            # Description is everything between item code and quantity/price
+            code_pos = first_line.find(item_data['item_code']) + len(item_data['item_code'])
+            if item_data['quantity']:
+                qty_pos = first_line.find(item_data['quantity'])
+                item_data['description'] = first_line[code_pos:qty_pos].strip()
+            else:
+                # If no quantity found, take everything after code until prices
+                price_pos = first_line.find(prices[0]) if prices else len(first_line)
+                item_data['description'] = first_line[code_pos:price_pos].strip()
+    
+    # Extract metadata from the entire block
+    customer_art_no = None
+    for line in block:
+        # Customer article number
+        art_match = re.search(r'your art\.-no\.:\s*([^\s;]+)', line, re.IGNORECASE)
+        if art_match:
+            customer_art_no = art_match.group(1)
+        
+        # Lot number
+        lot_match = re.search(r'LOT\s*([^;]+);', line, re.IGNORECASE)
+        if lot_match and not item_data['lot']:
+            item_data['lot'] = lot_match.group(1).strip()
+    
+    # Add customer article number to description if found
+    if customer_art_no and item_data['description']:
+        item_data['description'] += f" (Art-No: {customer_art_no})"
+    
+    # For multi-line descriptions, combine them
+    if len(block) > 1 and item_data['description']:
+        additional_desc = []
+        for i in range(1, len(block)):
+            line = block[i].strip()
+            # Only include lines that don't look like metadata or new items
+            if (line and 
+                not re.search(r'your art\.-no\.:|LOT\s*[^;]+;', line, re.IGNORECASE) and
+                not re.match(r'^\d+\s+[A-Z]', line) and
+                re.match(r'^[a-zA-Z\d]', line)):  # Starts with letter or number
+                additional_desc.append(line)
+        
+        if additional_desc:
+            item_data['description'] += ' - ' + ' '.join(additional_desc)
+    
+    # Extract unit price from alternative patterns if still missing
+    if not item_data['unit_price']:
+        prices = re.findall(r'\b(\d+[,.]\d{2})\b', ' '.join(block))
+        if len(prices) >= 2:  # Usually there are two prices: unit price and total
+            item_data['unit_price'] = prices[0].replace(',', '.')  # First price is unit price
+    
+    # Extract quantity from alternative patterns if still missing
+    if not item_data['quantity']:
+        # Look for quantity pattern with unit (St., pcs., etc.)
+        qty_match = re.search(r'(\d+)\s+(pcs\.|St\.)', ' '.join(block), re.IGNORECASE)
+        if qty_match:
+            item_data['quantity'] = qty_match.group(1)
+        else:
+            # Just look for a number that could be quantity
+            numbers = re.findall(r'\b(\d+)\b', first_line)
+            if len(numbers) >= 2:
+                item_data['quantity'] = numbers[1]  # Second number is often quantity
+    
+    # Only return if we have essential data
+    if item_data['item_code'] and item_data['description'] and item_data['quantity']:
+        return item_data
+    
+    return None
+
+def _extract_otto_ruttgers_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Otto Ruttgers invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'order_no': '',
+        'order_date': '',
+        'delivery_note': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number, customer number, and date from header line
+        # Pattern: "240268 48515 26.03.2024 1"
+        header_match = re.search(r'^(\d+)\s+(\d+)\s+(\d{2}\.\d{2}\.\d{4})\s+\d+$', line_clean)
+        if header_match:
+            if not invoice_data['invoice_number']:
+                invoice_data['invoice_number'] = header_match.group(1)
+            if not invoice_data['customer_number']:
+                invoice_data['customer_number'] = header_match.group(2)
+            if not invoice_data['invoice_date']:
+                invoice_data['invoice_date'] = header_match.group(3)
+        
+        # Alternative pattern for invoice number
+        inv_match = re.search(r'INVOICE NO\.\s*(\d+)', line_clean, re.IGNORECASE)
+        if inv_match and not invoice_data['invoice_number']:
+            invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Alternative pattern for customer number
+        cust_match = re.search(r'Cust\.-No\.\s*(\d+)', line_clean, re.IGNORECASE)
+        if cust_match and not invoice_data['customer_number']:
+            invoice_data['customer_number'] = cust_match.group(1)
+        
+        # Alternative pattern for date
+        date_match = re.search(r'Date\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if date_match and not invoice_data['invoice_date']:
+            invoice_data['invoice_date'] = date_match.group(1)
+        
+        # Extract delivery note
+        delivery_match = re.search(r'Delivery Note No\.\s*(\d+)\s*at\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if delivery_match and not invoice_data['delivery_note']:
+            invoice_data['delivery_note'] = delivery_match.group(1)
+    
+    return invoice_data
+
+
+#Phoenix Instruments
+def extract_phoenix_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Phoenix Instruments invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_phoenix_invoice_info(lines)
+            
+            # Find item blocks - Phoenix has a specific 2-line per item structure
+            item_blocks = []
+            current_item_lines = []
+            in_items_section = False
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if 'Item Number Alias item Description Ordered Shipped Back Ordered Price Amount' in line_clean:
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Skip header lines and summary lines
+                if (re.search(r'Item Number|Net Invoice|Less Discount|Freight|Tax|Tracking number|Invoice Total', line_clean, re.IGNORECASE) or
+                    'Continued' in line_clean):
+                    continue
+                
+                # Look for item number lines (start with numbers or P followed by numbers-dash-numbers)
+                if re.match(r'^(\d+-\d+|[A-Z]\d+-\d+)', line_clean) and not re.search(r'Whse:', line_clean):
+                    # If we have a complete item (2 lines), save it
+                    if len(current_item_lines) == 2:
+                        item_blocks.append((current_item_lines, invoice_data.copy()))
+                    current_item_lines = [line_clean]
+                # Look for alias item lines (they contain Whse: information)
+                elif current_item_lines and re.search(r'Whse:', line_clean):
+                    current_item_lines.append(line_clean)
+                    # This completes the item block
+                    item_blocks.append((current_item_lines, invoice_data.copy()))
+                    current_item_lines = []
+                # Stop if we hit summary section
+                elif re.search(r'Net Invoice|Less Discount|Freight|Tax|Tracking number|Invoice Total', line_clean, re.IGNORECASE):
+                    if current_item_lines:
+                        item_blocks.append((current_item_lines, invoice_data.copy()))
+                    break
+            
+            # Process each item block
+            for block, inv_data in item_blocks:
+                item_data = _parse_phoenix_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_phoenix_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Phoenix Instruments invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'order_no': '',
+        'order_date': '',
+        'delivery_note': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number (remove -IN suffix)
+        inv_match = re.search(r'Invoice Number:\s*([^\s]+)', line_clean)
+        if inv_match and not invoice_data['invoice_number']:
+            invoice_data['invoice_number'] = inv_match.group(1).replace('-IN', '')
+        
+        # Extract invoice date (US format: M/D/YYYY)
+        date_match = re.search(r'Invoice Date:\s*(\d{1,2}/\d{1,2}/\d{4})', line_clean)
+        if date_match and not invoice_data['invoice_date']:
+            us_date = date_match.group(1)
+            parts = us_date.split('/')
+            if len(parts) == 3:
+                invoice_data['invoice_date'] = f"{parts[1]}.{parts[0]}.{parts[2]}"
+        
+        # Extract customer number
+        cust_match = re.search(r'Customer Number:\s*([^\s]+)', line_clean)
+        if cust_match and not invoice_data['customer_number']:
+            invoice_data['customer_number'] = cust_match.group(1)
+        
+        # Extract order number
+        order_match = re.search(r'Order Number:\s*([^\s]+)', line_clean)
+        if order_match and not invoice_data['order_no']:
+            invoice_data['order_no'] = order_match.group(1)
+        
+        # Extract order date (US format: M/D/YYYY)
+        order_date_match = re.search(r'Order Date\s*(\d{1,2}/\d{1,2}/\d{4})', line_clean)
+        if order_date_match and not invoice_data['order_date']:
+            us_date = order_date_match.group(1)
+            parts = us_date.split('/')
+            if len(parts) == 3:
+                invoice_data['order_date'] = f"{parts[1]}.{parts[0]}.{parts[2]}"
+        
+        # Extract customer PO (delivery note)
+        po_match = re.search(r'Customer P\.O\.\s*(\d+)', line_clean)
+        if po_match and not invoice_data['delivery_note']:
+            invoice_data['delivery_note'] = po_match.group(1)
+    
+    return invoice_data
+
+def _parse_phoenix_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Phoenix Instruments invoice"""
+    if not block or len(block) < 2:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'order_no': invoice_data.get('order_no', ''),
+        'order_date': invoice_data.get('order_date', ''),
+        'delivery_note': invoice_data.get('delivery_note', ''),
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot': '',
+        'page': page_num + 1
+    }
+    
+    # Line 1: "106-5324 5.00 0.00 5.00 18.69 0.00"
+    first_line = block[0].strip()
+    
+    # Line 2: "G1764-35 Whse: 000"
+    second_line = block[1].strip()
+    
+    # Parse first line - extract item number, quantities, and prices
+    first_parts = first_line.split()
+    if len(first_parts) >= 6:
+        item_data['item_code'] = first_parts[0]  # e.g., "106-5324"
+        
+        # Use Shipped quantity (second number) - this is what was actually sent
+        shipped_qty = first_parts[1]  # "0.00" or "1.00" etc.
+        ordered_qty = first_parts[0] if first_parts[0].replace('-', '').isdigit() else first_parts[2]
+        back_ordered_qty = first_parts[3] if len(first_parts) > 3 else "0.00"
+        
+        # Use shipped quantity if available, otherwise use ordered quantity
+        if shipped_qty != '0.00':
+            item_data['quantity'] = shipped_qty
+        else:
+            item_data['quantity'] = ordered_qty
+        
+        item_data['unit_price'] = first_parts[4]  # e.g., "18.69"
+    
+    # Parse second line - extract alias item and warehouse
+    second_parts = second_line.split()
+    if second_parts:
+        alias_item = second_parts[0]  # e.g., "G1764-35"
+        
+        # Use alias item as the description
+        item_data['description'] = alias_item
+        
+        # Extract warehouse as lot number
+        whse_match = re.search(r'Whse:\s*(\d+)', second_line)
+        if whse_match:
+            item_data['lot'] = f"Whse:{whse_match.group(1)}"
+    
+    # For items with additional description in the second line
+    if len(second_parts) > 2:
+        # There might be additional description text before "Whse:"
+        desc_text = ' '.join(second_parts[1:-2])  # Skip first (alias) and last parts (Whse: 000)
+        if desc_text and desc_text != 'Whse:':
+            item_data['description'] = f"{alias_item} - {desc_text}"
+    
+    # Only return items with non-zero quantities
+    if (item_data['item_code'] and item_data['description'] and 
+        item_data['quantity'] and item_data['quantity'] != '0.00'):
+        return item_data
+    
+    return None
+
+
+#Precision Medical
+def extract_precision_medical_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Precision Medical invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_precision_medical_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section (table header)
+                if re.search(r'QTY\s+QTY\s+BACK\s+PMM PN\s*/\s*DESCRIPTION\s+UNIT\s+TOTAL', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                if re.search(r'Ordered\s+Shipped\s+Order\s+Customer PN\s+PRICE', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Skip header lines and summary lines
+                if (re.search(r'QTY\s+QTY\s+BACK|Ordered\s+Shipped|SUBTOTAL|EXCISE TAX|HANDLING FEE|TOTAL', line_clean, re.IGNORECASE) or
+                    'THANK YOU FOR YOUR ORDER!' in line_clean):
+                    continue
+                
+                # Look for item lines (they contain quantities and prices)
+                if re.match(r'^\d+\s+EA\s+\d+\s+-\s+', line_clean):  # e.g., "2 EA 2 - 5096-10/UR6107-21"
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = [line_clean]
+                # Look for DATE CODE lines that belong to the current item
+                elif current_block and re.match(r'DATE CODE:', line_clean, re.IGNORECASE):
+                    current_block.append(line_clean)
+                # Stop if we hit summary section
+                elif re.search(r'SUBTOTAL|EXCISE TAX|HANDLING FEE|TOTAL', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = []
+                    break
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy()))
+            
+            # Process each item block
+            for block, inv_data in item_blocks:
+                item_data = _parse_precision_medical_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_precision_medical_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Precision Medical invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'order_no': '',
+        'order_date': '',
+        'delivery_note': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number
+        inv_match = re.search(r'INVOICE Number:\s*(\d+)', line_clean, re.IGNORECASE)
+        if inv_match and not invoice_data['invoice_number']:
+            invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Extract invoice date (Month DD, YYYY format)
+        date_match = re.search(r'Date:\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})', line_clean, re.IGNORECASE)
+        if date_match and not invoice_data['invoice_date']:
+            # Convert "October 29, 2024" to "29.10.2024"
+            us_date = date_match.group(1)
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(us_date, '%B %d, %Y')
+                invoice_data['invoice_date'] = dt.strftime('%d.%m.%Y')
+            except ValueError:
+                # Fallback: try different format
+                try:
+                    dt = datetime.strptime(us_date, '%b %d, %Y')
+                    invoice_data['invoice_date'] = dt.strftime('%d.%m.%Y')
+                except ValueError:
+                    # Keep original format if conversion fails
+                    invoice_data['invoice_date'] = us_date
+        
+        # Extract order number
+        order_match = re.search(r'ORDER NO\.\s*(\d+)', line_clean, re.IGNORECASE)
+        if order_match and not invoice_data['order_no']:
+            invoice_data['order_no'] = order_match.group(1)
+            invoice_data['delivery_note'] = order_match.group(1)  # Use order number as delivery note
+        
+        # Extract ship date (US format: MM/DD/YYYY)
+        ship_date_match = re.search(r'SHIP DATE\s*(\d{1,2}/\d{1,2}/\d{4})', line_clean, re.IGNORECASE)
+        if ship_date_match and not invoice_data['order_date']:
+            us_date = ship_date_match.group(1)
+            parts = us_date.split('/')
+            if len(parts) == 3:
+                invoice_data['order_date'] = f"{parts[1]}.{parts[0]}.{parts[2]}"
+        
+        # Extract customer number (from the number below ORDER NO.)
+        # Pattern: "340-070-917" appears below the order information
+        cust_match = re.search(r'^\d{3}-\d{3}-\d{3}$', line_clean)
+        if cust_match and not invoice_data['customer_number']:
+            invoice_data['customer_number'] = cust_match.group(0)
+    
+    return invoice_data
+
+def _parse_precision_medical_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Precision Medical invoice"""
     if not block:
         return None
     
@@ -7459,73 +9119,4533 @@ def _parse_josef_betzler_item_block(block: List[str], invoice_data: Dict, page_n
         'page': page_num + 1
     }
     
-    # Extract customer reference from first line
+    # The first line contains the main item data
     first_line = block[0].strip()
-    customer_ref_match = re.search(r'your Ref\.:\s*([^\s]+)', first_line, re.IGNORECASE)
-    customer_ref = customer_ref_match.group(1) if customer_ref_match else None
     
-    # Find the item line (contains JB- code)
-    item_line = None
-    for line in block:
-        if 'JB-' in line:
-            item_line = line.strip()
-            break
-    
-    if not item_line:
-        return None
-    
-    # Parse the item line: "4 JB-5010-01 Heiss Wound Spreader shrp, 4x4 5 35,31 176,55"
-    item_match = re.search(r'(\d+)\s+(JB-\d+-\d+)\s+(.+?)\s+(\d+)\s+([\d,]+)\s+([\d,]+)$', item_line)
+    # Parse: "2 EA 2 - 5096-10/UR6107-21 Fansler Operating Speculum, Slotted Tube, 1-3/8" DIA, 2-3/8" LONG $110.00 $220.00"
+    item_match = re.search(r'^(\d+)\s+EA\s+(\d+)\s+-\s+([^\s]+)\s+(.+?)\$([\d,]+\.\d{2})\s+\$([\d,]+\.\d{2})$', first_line)
     
     if item_match:
-        item_data['item_code'] = item_match.group(2)
-        item_data['description'] = item_match.group(3).strip()
-        item_data['quantity'] = item_match.group(4)
-        item_data['unit_price'] = item_match.group(5).replace(',', '.')
+        ordered_qty = item_match.group(1)  # Ordered quantity
+        shipped_qty = item_match.group(2)  # Shipped quantity
+        item_data['item_code'] = item_match.group(3)  # e.g., "5096-10/UR6107-21"
+        item_data['description'] = item_match.group(4).strip()  # Description
+        item_data['unit_price'] = item_match.group(5).replace(',', '')  # Unit price
+        item_data['quantity'] = shipped_qty  # Use shipped quantity
+        
+        # Add ordered quantity to description for reference
+        item_data['description'] = f"{item_data['item_code']} - {item_data['description']} (Ordered: {ordered_qty}, Shipped: {shipped_qty})"
+    
+    # Alternative pattern if the first one fails
+    if not item_data['item_code']:
+        # Try a simpler approach - split and analyze
+        parts = first_line.split()
+        if len(parts) >= 7:
+            # Look for the pattern: number EA number - code description $price $total
+            for i in range(len(parts) - 4):
+                if (parts[i].isdigit() and 
+                    parts[i+1] == 'EA' and 
+                    parts[i+2].isdigit() and 
+                    parts[i+3] == '-'):
+                    item_data['quantity'] = parts[i+2]  # Shipped quantity
+                    item_data['item_code'] = parts[i+4]  # Item code
+                    
+                    # Find the description (everything between code and $)
+                    desc_start = first_line.find(parts[i+4]) + len(parts[i+4]) + 1
+                    # Find where prices start
+                    dollar_pos = first_line.find('$', desc_start)
+                    if dollar_pos != -1:
+                        item_data['description'] = first_line[desc_start:dollar_pos].strip()
+                    
+                    # Find prices
+                    prices = re.findall(r'\$([\d,]+\.\d{2})', first_line)
+                    if prices:
+                        item_data['unit_price'] = prices[0].replace(',', '')
+                    
+                    break
+    
+    # Extract date code from the block
+    for line in block:
+        date_code_match = re.search(r'DATE CODE:\s*([^\s]+)', line, re.IGNORECASE)
+        if date_code_match:
+            item_data['lot'] = f"DateCode:{date_code_match.group(1)}"
+            break
+    
+    # Only return if we have essential data
+    if item_data['item_code'] and item_data['description'] and item_data['quantity']:
+        return item_data
+    
+    return None
+
+#Rebstock
+def extract_rebstock_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Rebstock invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_rebstock_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            current_order_info = {'order_no': '', 'order_date': ''}
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if re.search(r'POS\s+ARTICLE\s+DESCRIPTION\s+QTY\.\s+UNIT\s+TOTAL', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Skip header lines and summary lines
+                if (re.search(r'POS\s+ARTICLE|TOTAL/EUR|Payment terms|Delivery terms|Shipment', line_clean, re.IGNORECASE) or
+                    line_clean == 'DESCRIPTION QTY. UNIT TOTAL'):
+                    continue
+                
+                # Look for order information
+                order_match = re.search(r'Your order no\.\s*([^\s-]+)\s*-\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+                if order_match:
+                    current_order_info = {
+                        'order_no': order_match.group(1),
+                        'order_date': order_match.group(2)
+                    }
+                    continue
+                
+                # Look for lines that start with position numbers followed by item codes
+                if re.match(r'^\d+\s+\d{2}-\d{2}-\d{3}', line_clean):  # e.g., "1 06-06-917"
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_info.copy()))
+                    current_block = [line_clean]
+                
+                # Continue collecting lines for the current item
+                elif current_block:
+                    # Stop if we hit a new item or summary section
+                    if (re.match(r'^\d+\s+\d{2}-\d{2}-\d{3}', line_clean) or
+                        re.search(r'TOTAL/EUR|Payment terms|Delivery terms', line_clean, re.IGNORECASE)):
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_info.copy()))
+                        current_block = [line_clean] if re.match(r'^\d+\s+\d{2}-\d{2}-\d{3}', line_clean) else []
+                    else:
+                        current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy(), current_order_info.copy()))
+            
+            # Process each item block
+            for block, inv_data, order_info in item_blocks:
+                item_data = _parse_rebstock_item_block(block, inv_data, order_info, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_rebstock_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Rebstock invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'order_no': '',
+        'order_date': '',
+        'delivery_note': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number
+        inv_match = re.search(r'COMMERCIAL INVOICE\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if inv_match and not invoice_data['invoice_number']:
+            invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Extract invoice date
+        date_match = re.search(r'DATE\s*:\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if date_match and not invoice_data['invoice_date']:
+            invoice_data['invoice_date'] = date_match.group(1)
+        
+        # Extract customer number
+        cust_match = re.search(r'CUST\.-NO\.\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if cust_match and not invoice_data['customer_number']:
+            invoice_data['customer_number'] = cust_match.group(1)
+        
+        # Extract delivery note
+        delivery_match = re.search(r'Delivery Note No\.\s*(\d+)\s*of\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if delivery_match and not invoice_data['delivery_note']:
+            invoice_data['delivery_note'] = delivery_match.group(1)
+    
+    return invoice_data
+
+def _parse_rebstock_item_block(block: List[str], invoice_data: Dict, order_info: Dict, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Rebstock invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'order_no': order_info.get('order_no', invoice_data.get('order_no', '')),
+        'order_date': order_info.get('order_date', invoice_data.get('order_date', '')),
+        'delivery_note': invoice_data.get('delivery_note', ''),
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot': '',
+        'page': page_num + 1
+    }
+    
+    # The first line should contain the main item data
+    first_line = block[0].strip()
+    
+    # Extract position number (remove it since we don't need it)
+    pos_match = re.search(r'^(\d+)\s+', first_line)
+    if pos_match:
+        first_line = first_line[len(pos_match.group(0)):].strip()
+    
+    # Parse the item line: "06-06-917 CASPAR vertebral body dissector 205 mm 1 pcs. 89,90 89,90"
+    item_match = re.search(r'^(\d{2}-\d{2}-\d{3})\s+(.+?)\s+(\d+)\s+pcs\.\s+([\d,]+)\s+[\d,]+$', first_line)
+    
+    if item_match:
+        item_data['item_code'] = item_match.group(1).strip()
+        item_data['description'] = item_match.group(2).strip()
+        item_data['quantity'] = item_match.group(3)
+        item_data['unit_price'] = item_match.group(4).replace(',', '.')
+    
+    # Alternative pattern for different formatting
+    if not item_data['item_code']:
+        alt_match = re.search(r'^(\d{2}-\d{2}-\d{3})\s+(.+?)\s+(\d+)\s+pcs\.\s+([\d,]+)', first_line)
+        if alt_match:
+            item_data['item_code'] = alt_match.group(1).strip()
+            item_data['description'] = alt_match.group(2).strip()
+            item_data['quantity'] = alt_match.group(3)
+            item_data['unit_price'] = alt_match.group(4).replace(',', '.')
     
     # Extract metadata from the entire block
+    customer_art_no = None
+    lst_no = None
     for line in block:
+        # Customer article number
+        art_match = re.search(r'your art\.-no\.:\s*([^\s]+)', line, re.IGNORECASE)
+        if art_match:
+            customer_art_no = art_match.group(1)
+        
         # LST number
-        lst_match = re.search(r'LST\s*([A-Z]\d+)', line, re.IGNORECASE)
+        lst_match = re.search(r'LST No\.:\s*([^\s]+)', line, re.IGNORECASE)
         if lst_match:
             lst_no = lst_match.group(1)
-            if lst_no and item_data['description']:
-                item_data['description'] += f" (LST: {lst_no})"
         
-        # Charge (lot number)
-        charge_match = re.search(r'Charge:\s*([^\s]+)', line, re.IGNORECASE)
-        if charge_match and not item_data['lot']:
-            item_data['lot'] = charge_match.group(1)
+        # Lot number
+        lot_match = re.search(r'Lot No\.\s*([^\s]+)', line, re.IGNORECASE)
+        if lot_match and not item_data['lot']:
+            item_data['lot'] = lot_match.group(1)
+    
+    # Add customer article number to description if found
+    if customer_art_no and item_data['description']:
+        item_data['description'] += f" (Art-No: {customer_art_no})"
+    
+    # Add LST number to description if found
+    if lst_no and item_data['description']:
+        item_data['description'] += f" (LST: {lst_no})"
+    
+    # For multi-line descriptions, combine them
+    if len(block) > 1 and item_data['description']:
+        additional_desc = []
+        for line in block[1:]:
+            # Only include lines that don't look like metadata
+            if not re.search(r'your art\.-no\.:|LST No\.:|Lot No\.', line, re.IGNORECASE):
+                clean_line = line.strip()
+                if clean_line and not re.match(r'^\d+\s+\d{2}-\d{2}-\d{3}', clean_line):  # Don't include lines that start like new items
+                    # Check if this line contains additional description
+                    if re.match(r'^[a-zA-Z]', clean_line):  # Starts with a letter
+                        additional_desc.append(clean_line)
         
-        # Classification
-        class_match = re.search(r'Classification:\s*([^\s]+)', line, re.IGNORECASE)
-        if class_match:
-            class_no = class_match.group(1)
-            if class_no and item_data['description']:
-                item_data['description'] += f" (Class: {class_no})"
-        
-        # Quantity from Charge line (more reliable)
-        qty_match = re.search(r'Quantity:\s*(\d+)', line, re.IGNORECASE)
+        if additional_desc:
+            item_data['description'] += ' - ' + ' '.join(additional_desc)
+    
+    # Extract unit price from alternative patterns if still missing
+    if not item_data['unit_price']:
+        prices = re.findall(r'\b(\d+[,.]\d{2})\b', first_line)
+        if len(prices) >= 2:  # Usually there are two prices: unit price and total
+            item_data['unit_price'] = prices[0].replace(',', '.')  # First price is unit price
+    
+    # Extract quantity from alternative patterns if still missing
+    if not item_data['quantity']:
+        # Look for quantity pattern with "pcs."
+        qty_match = re.search(r'(\d+)\s+pcs\.', first_line, re.IGNORECASE)
         if qty_match:
             item_data['quantity'] = qty_match.group(1)
-    
-    # Add customer reference to description if found
-    if customer_ref and item_data['description']:
-        item_data['description'] = f"{customer_ref} - {item_data['description']}"
-    
-    # Extract order information from the "Your order" line that ends this record
-    for line in block:
-        order_match = re.search(r'Your order\s+([^\s]+)\s+dtd\.\s+(\d{2}\.\d{2}\.\d{4})', line, re.IGNORECASE)
-        if order_match:
-            item_data['order_no'] = order_match.group(1)
-            item_data['order_date'] = order_match.group(2)
-            break
     
     # Only return if we have essential data
     if item_data['description'] and item_data['quantity']:
         return item_data
     
     return None
+
+
+#Rica
+def extract_rica_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Rica Surgical invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_rica_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section (table header)
+                if re.search(r'Quantity\s+B/O\s+Item Code\s+Description\s+Price Each\s+Amount', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Skip header lines and summary lines
+                if (re.search(r'Quantity\s+B/O|UPS Package|Sales Tax|Total USD', line_clean, re.IGNORECASE) or
+                    'Phone # Fax # Web Site' in line_clean):
+                    continue
+                
+                # Look for item lines (they contain quantities and item codes)
+                if re.match(r'^\d+\s+\d+\s+[A-Z]', line_clean):  # e.g., "20 0 WSR-6"
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = [line_clean]
+                # Continue collecting description lines for the current item
+                elif current_block and line_clean and not re.match(r'^\d', line_clean):
+                    # Stop if we hit a new section
+                    if re.search(r'UPS Package|Sales Tax|Total USD', line_clean, re.IGNORECASE):
+                        item_blocks.append((current_block, invoice_data.copy()))
+                        current_block = []
+                        break
+                    else:
+                        current_block.append(line_clean)
+                # Stop if we hit summary section
+                elif re.search(r'UPS Package|Sales Tax|Total USD', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = []
+                    break
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy()))
+            
+            # Process each item block
+            for block, inv_data in item_blocks:
+                item_data = _parse_rica_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_rica_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Rica Surgical invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'order_no': '',
+        'order_date': '',
+        'delivery_note': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number and date from header
+        # Pattern: "09/20/2024 110669"
+        header_match = re.search(r'(\d{2}/\d{2}/\d{4})\s+(\d+)', line_clean)
+        if header_match:
+            if not invoice_data['invoice_date']:
+                # Convert US date format to European format DD.MM.YYYY
+                us_date = header_match.group(1)
+                parts = us_date.split('/')
+                if len(parts) == 3:
+                    invoice_data['invoice_date'] = f"{parts[1]}.{parts[0]}.{parts[2]}"
+            if not invoice_data['invoice_number']:
+                invoice_data['invoice_number'] = header_match.group(2)
+        
+        # Extract order number
+        ord_match = re.search(r'Ord Number\s+(\d+)', line_clean, re.IGNORECASE)
+        if ord_match and not invoice_data['order_no']:
+            invoice_data['order_no'] = ord_match.group(1)
+        
+        # Extract P.O. Number (delivery note)
+        po_match = re.search(r'P\.O\. Number\s+([^\s]+)', line_clean, re.IGNORECASE)
+        if po_match and not invoice_data['delivery_note']:
+            invoice_data['delivery_note'] = po_match.group(1)
+            invoice_data['order_no'] = po_match.group(1)  # Also use as order number
+        
+        # Extract tracking number as alternative delivery note
+        tracking_match = re.search(r'Tracking #:\s*([^\s]+)', line_clean, re.IGNORECASE)
+        if tracking_match and not invoice_data['delivery_note']:
+            invoice_data['delivery_note'] = tracking_match.group(1)
+    
+    return invoice_data
+
+def _parse_rica_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Rica Surgical invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'order_no': invoice_data.get('order_no', ''),
+        'order_date': invoice_data.get('order_date', ''),
+        'delivery_note': invoice_data.get('delivery_note', ''),
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot': '',
+        'page': page_num + 1
+    }
+    
+    # The first line contains the main item data
+    first_line = block[0].strip()
+    
+    # Parse: "20 0 WSR-6 WEINSTEIN RACK STRINGER 6" LONG 2.75" WIDE 10.32 206.40"
+    item_match = re.search(r'^(\d+)\s+\d+\s+([^\s]+)\s+(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})$', first_line)
+    
+    if item_match:
+        item_data['quantity'] = item_match.group(1)
+        item_data['item_code'] = item_match.group(2)  # e.g., "WSR-6"
+        item_data['description'] = item_match.group(3).strip()
+        item_data['unit_price'] = item_match.group(4)  # e.g., "10.32"
+    
+    # Alternative pattern for different formatting
+    if not item_data['item_code']:
+        alt_match = re.search(r'^(\d+)\s+\d+\s+([^\s]+)\s+(.+?)\s+([\d,]+\.\d{2})', first_line)
+        if alt_match:
+            item_data['quantity'] = alt_match.group(1)
+            item_data['item_code'] = alt_match.group(2)
+            item_data['description'] = alt_match.group(3).strip()
+            item_data['unit_price'] = alt_match.group(4)
+    
+    # If still no match, try a more flexible approach
+    if not item_data['item_code']:
+        parts = first_line.split()
+        if len(parts) >= 5:
+            # Look for the pattern: number number code description price price
+            for i in range(2, len(parts) - 2):
+                if re.match(r'^[A-Z]-', parts[i]) or re.match(r'^[A-Z]{2,}', parts[i]):  # Item code pattern
+                    item_data['quantity'] = parts[0]
+                    item_data['item_code'] = parts[i]
+                    
+                    # Description is everything between code and prices
+                    code_pos = first_line.find(parts[i]) + len(parts[i])
+                    # Find prices (look for decimal numbers)
+                    prices = []
+                    for j in range(i+1, len(parts)):
+                        if re.match(r'^\d+\.\d{2}$', parts[j]):
+                            prices.append(parts[j])
+                    
+                    if prices:
+                        price_pos = first_line.find(prices[0])
+                        item_data['description'] = first_line[code_pos:price_pos].strip()
+                        item_data['unit_price'] = prices[0]
+                    break
+    
+    # Extract lot number from the block
+    for line in block:
+        lot_match = re.search(r'LOT#\s*([^\s]+)', line, re.IGNORECASE)
+        if lot_match and not item_data['lot']:
+            item_data['lot'] = lot_match.group(1)
+    
+    # For multi-line descriptions, combine them
+    if len(block) > 1 and item_data['description']:
+        additional_desc = []
+        for i in range(1, len(block)):
+            line = block[i].strip()
+            # Skip lines that contain lot numbers or look like new items
+            if (line and 
+                not re.search(r'LOT#', line, re.IGNORECASE) and
+                not re.match(r'^\d+\s+\d+\s+[A-Z]', line) and
+                not re.search(r'UPS Package|Sales Tax|Total USD', line, re.IGNORECASE)):
+                additional_desc.append(line)
+        
+        if additional_desc:
+            item_data['description'] += ' - ' + ' '.join(additional_desc)
+    
+    # Extract unit price from alternative patterns if still missing
+    if not item_data['unit_price']:
+        prices = re.findall(r'\b(\d+\.\d{2})\b', first_line)
+        if prices:
+            item_data['unit_price'] = prices[0]  # First price is unit price
+    
+    # Only return if we have essential data and non-zero quantity
+    if (item_data['item_code'] and item_data['description'] and 
+        item_data['quantity'] and item_data['quantity'] != '0'):
+        return item_data
+    
+    return None
+
+#Rominger Invoice not available 
+
+#Rudischhauser
+def extract_rudischhauser_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Rudischhauser invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_rudischhauser_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            current_po = ""
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if re.search(r'pos\s+item\s+description\s+quantity.*€.*each.*€.*total',
+                             line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Skip header/summary lines
+                if (re.search(r'pos\s+item|Total net|Total amount|Packaging|Carry-over',
+                              line_clean, re.IGNORECASE) or
+                    'Rudischhauser Surgical' in line_clean):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_po))
+                        current_block = []
+                    continue
+                
+                # Look for PO number lines
+                po_match = re.search(r'Your P\.O\. no\.\s+([^\s-]+)', line_clean, re.IGNORECASE)
+                if po_match:
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_po))
+                    current_po = po_match.group(1)
+                    current_block = []
+                    continue
+                
+                # Look for item lines (allow multiple letters in code)
+                if re.match(r'^\d+\s+[A-Z]+.*\d', line_clean):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_po))
+                    current_block = [line_clean]
+                # Continue collecting description lines
+                elif current_block and line_clean:
+                    current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy(), current_po))
+            
+            # Process each item block
+            for block, inv_data, po_no in item_blocks:
+                item_data = _parse_rudischhauser_item_block(block, inv_data, po_no, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _parse_rudischhauser_item_block(block: List[str], invoice_data: Dict, po_no: str, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Rudischhauser invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'order_no': po_no,
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot_number': '',
+        'page': page_num + 1
+    }
+    
+    # Parse first line for item code
+    first_line = block[0].strip()
+    first_parts = first_line.split()
+    if len(first_parts) >= 3:
+        item_data['item_code'] = " ".join(first_parts[1:])
+    
+    # Look for description + pcs + €
+    for line in block:
+        line_clean = line.strip()
+        desc_match = re.search(
+            r'(.+?)\s+(\d+)\s+pcs\.\s+([\d,]+)\s*€',
+            line_clean
+        )
+        if desc_match:
+            item_data['description'] = desc_match.group(1).strip()
+            item_data['quantity'] = desc_match.group(2)
+            item_data['unit_price'] = desc_match.group(3).replace(',', '.')
+            break
+    
+    # If still missing description, try fallback
+    if not item_data['description']:
+        for line in block:
+            if 'pcs.' in line:
+                parts = line.split()
+                for j, part in enumerate(parts):
+                    if part == 'pcs.' and j >= 2:
+                        item_data['description'] = ' '.join(parts[:j-1])
+                        item_data['quantity'] = parts[j-1]
+                        price_parts = parts[j+1:]
+                        prices = [p.replace(',', '.') for p in price_parts if re.match(r'^\d+,\d{2}$', p)]
+                        if prices:
+                            item_data['unit_price'] = prices[0]
+                        break
+    
+    # Extract lot number
+    for line in block:
+        lot_match = re.search(r'Lot number\s*([^/\n]+)', line, re.IGNORECASE)
+        if lot_match:
+            item_data['lot_number'] = lot_match.group(1).strip()
+            break
+    
+    # Additional description lines
+    if len(block) > 1 and item_data['description']:
+        additional_desc = []
+        for i in range(1, len(block)):
+            line = block[i].strip()
+            if (line and 
+                not re.search(r'pcs\.|[\d,]+\s*€|Lot number|^\d+\s+[A-Z]', line) and
+                line != item_data['description']):
+                additional_desc.append(line)
+        if additional_desc:
+            item_data['description'] += ' - ' + ' '.join(additional_desc)
+    
+    if (item_data['item_code'] and item_data['description'] and 
+        item_data['quantity'] and item_data['quantity'] != '0'):
+        return item_data
+    
+    return None
+
+def _extract_rudischhauser_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Rudischhauser invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'supplier_no': '',
+        'dev_no': '',
+        'our_reference': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number: "Novo Surgical Inc. INVOICE : 9240991"
+        inv_match = re.search(r'INVOICE\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if inv_match:
+            invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Extract customer number: "Customer No. : 11406"
+        cust_match = re.search(r'Customer No\.\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if cust_match:
+            invoice_data['customer_number'] = cust_match.group(1)
+        
+        # Extract invoice date: "Date : 18.09.2024"
+        date_match = re.search(r'Date\s*:\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if date_match:
+            invoice_data['invoice_date'] = date_match.group(1)
+        
+        # Extract supplier number: "supplier no. : 02-2500029"
+        supp_match = re.search(r'supplier no\.\s*:\s*([^\s]+)', line_clean, re.IGNORECASE)
+        if supp_match:
+            invoice_data['supplier_no'] = supp_match.group(1)
+        
+        # Extract DEV number: "DEV: 8010300"
+        dev_match = re.search(r'DEV:\s*([^\s]+)', line_clean, re.IGNORECASE)
+        if dev_match:
+            invoice_data['dev_no'] = dev_match.group(1)
+        
+        # Extract our reference: "Our reference : WT"
+        ref_match = re.search(r'Our reference\s*:\s*([^\s]+)', line_clean, re.IGNORECASE)
+        if ref_match:
+            invoice_data['our_reference'] = ref_match.group(1)
+    
+    return invoice_data
+
+
+#Rudolf Storz
+def extract_rudolfstorz_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Rudolf Storz invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+            
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_rudolfstorz_invoice_info(lines)
+            
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            current_po = ""
+            
+            for line in lines:
+                line_clean = line.strip()
+                
+                # Detect item header
+                if re.search(r'POS\s+ARTICLE\s+description\s+qty.*EUR', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Skip carry-over and totals
+                if re.search(r'carry-over|total net|total/EUR|package', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_po))
+                        current_block = []
+                    continue
+                
+                # Detect "your order no."
+                po_match = re.search(r'your order no\.\s*([^\s-]+)', line_clean, re.IGNORECASE)
+                if po_match:
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_po))
+                    current_po = po_match.group(1)
+                    current_block = []
+                    continue
+                
+                # Detect item line (starts with pos number)
+                if re.match(r'^\d+\s+\S+', line_clean):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_po))
+                    current_block = [line_clean]
+                elif current_block and line_clean:
+                    current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy(), current_po))
+            
+            # Process each block
+            for block, inv_data, po_no in item_blocks:
+                item_data = _parse_rudolfstorz_item_block(block, inv_data, po_no, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_rudolfstorz_invoice_info(lines: List[str]) -> Dict:
+    """Extract invoice-level metadata from Rudolf Storz invoice."""
+    invoice_data = {
+        'invoice_date': '',
+        'invoice_number': '',
+        'customer_number': ''
+    }
+    
+    for i, line in enumerate(lines):
+        # Invoice number + date
+        inv_match = re.search(r'INVOICE\s+(\d+)\s+Date\s+(\d{2}\.\d{2}\.\d{4})', line, re.IGNORECASE)
+        if inv_match:
+            invoice_data['invoice_number'] = inv_match.group(1)
+            invoice_data['invoice_date'] = inv_match.group(2)
+        
+        # Customer number may be on the following line after "Cust.-No."
+        if "Cust.-No." in line and i + 1 < len(lines):
+            next_line = lines[i + 1]
+            # Preferred pattern: "PM 12214"
+            cust_match = re.search(r'PM\s+(\d+)', next_line, re.IGNORECASE)
+            if cust_match:
+                invoice_data['customer_number'] = cust_match.group(1)
+            else:
+                # Fallback: last number on the line
+                fallback_match = re.search(r'(\d+)(?=\s*page:)', next_line, re.IGNORECASE)
+                if fallback_match:
+                    invoice_data['customer_number'] = fallback_match.group(1)
+    
+    return invoice_data
+
+def _parse_rudolfstorz_item_block(block: List[str], invoice_data: Dict, po_no: str, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Rudolf Storz invoice."""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'order_no': po_no,
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot_number': '',
+        'page': page_num + 1
+    }
+    
+    first_line = block[0].strip()
+    parts = first_line.split()
+    if len(parts) >= 6:
+        # Example: "1 558001 Cooley Atrial Valve Retractors 1 pcs. 80,55 80,55"
+        item_data['item_code'] = parts[1]
+        item_data['description'] = " ".join(parts[2:-4])  # everything until qty
+        item_data['quantity'] = parts[-4]  # numeric qty (e.g., "1")
+        item_data['unit_price'] = parts[-2].replace(',', '.')  # "80.55"
+    
+    # Look for additional description + lot number
+    for line in block[1:]:
+        if re.search(r'Chargen-/Lot-Nr\.\s*(.+)', line, re.IGNORECASE):
+            lot_match = re.search(r'Chargen-/Lot-Nr\.\s*(.+)', line, re.IGNORECASE)
+            if lot_match:
+                item_data['lot_number'] = lot_match.group(1).strip()
+        else:
+            if line and not re.match(r'^\d+\s+\S+', line):
+                item_data['description'] += " " + line.strip()
+    
+    if item_data['item_code'] and item_data['description'] and item_data['quantity']:
+        return item_data
+    
+    return None
+
+
+#Ruhof
+def extract_ruhof_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Ruhof invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+            
+            lines = text.split("\n")
+            invoice_data = _extract_ruhof_invoice_info(lines)
+            
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            
+            for line in lines:
+                line_clean = line.strip()
+                
+                # Detect item header
+                if re.search(r'UNITS\s+UOM\s+ITEM\s+CODE\s+DESCRIPTION', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Stop parsing when totals start
+                if re.search(r'Net Invoice:|Invoice Total:', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                        current_block = []
+                    break
+                
+                # Detect item line: starts with a number qty + UOM + item code
+                if re.match(r'^\d+\s+\S+\s+\S+', line_clean):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = [line_clean]
+                elif current_block and line_clean:
+                    # continuation line → add to description
+                    current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy()))
+            
+            # Parse each item block
+            for block, inv_data in item_blocks:
+                item_data = _parse_ruhof_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_ruhof_invoice_info(lines: List[str]) -> Dict:
+    """Extract invoice-level metadata from Ruhof invoice."""
+    invoice_data = {
+        'invoice_date': '',
+        'invoice_number': '',
+        'customer_number': '',
+        'order_no': '',
+        'po_number': ''
+    }
+    
+    for line in lines:
+        # Invoice header line
+        inv_match = re.search(
+            r'(\d{7,}-IN)\s+(\d{1,2}/\d{1,2}/\d{4})\s+(\d+)\s+(\d{1,2}/\d{1,2}/\d{4})\s+(\S+)\s+(\d+)',
+            line
+        )
+        if inv_match:
+            invoice_data['invoice_number'] = inv_match.group(1)      # e.g. 4969153-IN
+            invoice_data['invoice_date'] = inv_match.group(2)        # e.g. 4/29/2024
+            invoice_data['order_no'] = inv_match.group(3)            # e.g. 0890258
+            invoice_data['customer_number'] = inv_match.group(5)     # e.g. 00-0031456
+            invoice_data['po_number'] = inv_match.group(6)           # e.g. 0016494
+    
+    return invoice_data
+
+def _parse_ruhof_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """
+    Parse a Ruhof invoice item block (may span multiple lines).
+    Example block:
+    [
+        '2 EACH 34560-21 PREPZYME w/BIOCLEAN TECH 2 16.91 33.82',
+        '(32oz/946ml with foam sprayer)'
+    ]
+    """
+    if not block:
+        return None
+
+    # First line contains structured fields
+    first_line = block[0]
+
+    match = re.match(
+        r'^(\d+)\s+(\w+)\s+([\w-]+)\s+(.+?)\s+(\d+)\s+([\d.]+)\s+([\d.]+)$',
+        first_line
+    )
+    if not match:
+        return None
+
+    qty, _, item_code, description, pkgs, unit_price, _ = match.groups()
+
+    # If there are continuation lines, append them to description
+    if len(block) > 1:
+        continuation = " ".join(block[1:]).strip()
+        description = f"{description} {continuation}"
+
+    return {
+        "invoice_number": invoice_data.get("invoice_number", ""),
+        "invoice_date": invoice_data.get("invoice_date", ""),
+        "customer_number": invoice_data.get("customer_number", ""),
+        "po_number": invoice_data.get("po_number", ""),
+        "quantity": qty,
+        "item_code": item_code,
+        "description": description.strip(),
+        "pkgs": pkgs,
+        "unit_price": unit_price,
+        "page_number": page_num + 1  # optional
+        # uom removed
+        # amount removed
+    }
+
+
+#S.u.A. Martin
+def extract_sua_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from S.u.A. Martin invoice format.
+    Returns a list of dictionaries for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            invoice_data = _extract_sua_invoice_info(lines)
+
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+
+            for line in lines:
+                line_clean = line.strip()
+
+                # Detect start of item section
+                if re.search(r'POS\.\s+ARTICLE\s+description\s+qty', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+
+                if not in_items_section:
+                    continue
+
+                # Stop parsing when totals appear
+                if re.search(r'total\s+net|total/EUR|package|payment', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                        current_block = []
+                    break
+
+                # Detect item line: starts with item no + code
+                if re.match(r'^\d+\s+\S+\s+\S+', line_clean):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = [line_clean]
+                elif current_block and line_clean:
+                    # continuation line → part of description
+                    current_block.append(line_clean)
+
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy()))
+
+            # Parse blocks
+            for block, inv_data in item_blocks:
+                item_data = _parse_sua_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+
+    return extracted_data
+
+def _extract_sua_invoice_info(lines: List[str]) -> Dict:
+    """Extract invoice-level metadata from S.u.A. Martin invoice."""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'dev_no': '',
+        'dii_no': ''
+    }
+
+    for line in lines:
+        if "INVOICE NO." in line:
+            m = re.search(r'INVOICE NO.\s*:(\S+)', line)
+            if m:
+                invoice_data['invoice_number'] = m.group(1)
+
+        if "Cust.-No." in line:
+            m = re.search(r'Cust.-No.\s*:(\S+)', line)
+            if m:
+                invoice_data['customer_number'] = m.group(1)
+
+        if "Date" in line:
+            m = re.search(r'Date\s*:(\S+)', line)
+            if m:
+                invoice_data['invoice_date'] = m.group(1)
+
+        if "DEV-No." in line:
+            m = re.search(r'DEV-No.\s*:(\S+)', line)
+            if m:
+                invoice_data['dev_no'] = m.group(1)
+
+        if "DII-NO." in line:
+            m = re.search(r'DII-NO.\s*:(\S+)', line)
+            if m:
+                invoice_data['dii_no'] = m.group(1)
+
+    return invoice_data
+
+def _parse_sua_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """
+    Parse an item block from S.u.A. Martin invoices.
+    Each block may span multiple lines, starting with "your order no.".
+    """
+    if not block:
+        return None
+
+    order_number = ""
+    order_date = ""
+    art_number = ""
+    lot_number = ""
+    description_lines = []
+    qty = ""
+    unit_price = ""
+
+    for line in block:
+        line = line.strip()
+
+        # Extract order no. and date
+        match_order = re.match(r"your order no\. (\d+)\s*-\s*(\d{2}\.\d{2}\.\d{4})", line, re.I)
+        if match_order:
+            order_number, order_date = match_order.groups()
+            continue
+
+        # Extract line with qty + unit price (ignore total)
+        match_item = re.match(
+            r"^\d+\s+SAM\s+[A-Z0-9/ ]+\s+(\d+)\s+([\d,.]+)\s+[\d,.]+$", line
+        )
+        if match_item:
+            qty, unit_price = match_item.groups()
+            continue
+
+        # Extract art number
+        match_art = re.search(r"your art\.:\s*([A-Za-z0-9-]+)", line, re.I)
+        if match_art:
+            art_number = match_art.group(1)
+            continue
+
+        # Extract lot number
+        match_lot = re.search(r"Lot number\s+([A-Za-z0-9/ ]+)", line, re.I)
+        if match_lot:
+            lot_number = match_lot.group(1)
+            continue
+
+        # Otherwise treat as description
+        if line and not line.lower().startswith("lot-code"):
+            description_lines.append(line)
+
+    description = " ".join(description_lines).strip()
+
+    return {
+        "invoice_number": invoice_data.get("invoice_number", ""),
+        "invoice_date": invoice_data.get("invoice_date", ""),
+        "customer_number": invoice_data.get("customer_number", ""),
+        "order_number": order_number,
+        "order_date": order_date,
+        "art_number": art_number,
+        "lot_number": lot_number,
+        "description": description,
+        "quantity": qty,
+        "unit_price": unit_price,
+        "page_number": page_num + 1
+    }
+
+#Schmid
+def extract_schmid_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Schmid invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+
+            # Extract invoice-level info
+            invoice_data = _extract_schmid_invoice_info(lines)
+
+            # Identify item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+
+                # Start of items section
+                if re.search(r'POS\s+article\s+description\s+qty', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+
+                if not in_items_section:
+                    continue
+
+                # Stop when totals/summary begins
+                if re.search(r'total\s+net|total/EUR|payment|delivery|package', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = []
+                    break
+
+                # Item start (line with pos number and qty + prices)
+                if re.match(r'^\d+\s+[A-Za-z0-9-]+.*\d+[\.,]\d+\s+\d+[\.,]\d+$', line_clean):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = [line_clean]
+                # Continuation lines (descriptions, lot, art, etc.)
+                elif current_block and line_clean:
+                    current_block.append(line_clean)
+
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy()))
+
+            # Process each block
+            for block, inv_data in item_blocks:
+                item_data = _parse_schmid_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+
+    return extracted_data
+
+def _extract_schmid_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice-level information from Schmid invoice"""
+    invoice_data = {
+        "invoice_number": "",
+        "invoice_date": "",
+        "customer_number": "",
+        "order_no": "",
+        "order_date": "",
+        "delivery_note": ""
+    }
+
+    for line in lines:
+        line_clean = line.strip()
+
+        inv_match = re.search(r'INVOICE NO\.\s*:\s*(\d+)', line_clean, re.I)
+        if inv_match and not invoice_data["invoice_number"]:
+            invoice_data["invoice_number"] = inv_match.group(1)
+
+        date_match = re.search(r'Date\s*:\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.I)
+        if date_match and not invoice_data["invoice_date"]:
+            invoice_data["invoice_date"] = date_match.group(1)
+
+        cust_match = re.search(r'Cust\.-No\.\s*:\s*(\d+)', line_clean, re.I)
+        if cust_match and not invoice_data["customer_number"]:
+            invoice_data["customer_number"] = cust_match.group(1)
+
+        dn_match = re.search(r'Delivery Note No\.\s*(\d+)', line_clean, re.I)
+        if dn_match and not invoice_data["delivery_note"]:
+            invoice_data["delivery_note"] = dn_match.group(1)
+
+        ord_match = re.search(r'your order no\.\s*(\d+)\s*-\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.I)
+        if ord_match and not invoice_data["order_no"]:
+            invoice_data["order_no"], invoice_data["order_date"] = ord_match.groups()
+
+    return invoice_data
+
+def _parse_schmid_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """
+    Parse an individual item block from Schmid invoices.
+    """
+    if not block:
+        return None
+
+    quantity = ""
+    description_lines = []
+    unit_price = ""
+    art_number = ""
+    lot_number = ""
+    order_number = ""
+    order_date = ""
+
+    # First line with qty + description + unit price + line total
+    first_line = block[0].strip()
+    match = re.match(r'^\d+\s+[A-Z0-9/-]+\s+(.+?)\s+(\d+)\s+([\d,.]+)\s+[\d,.]+$', first_line)
+    if match:
+        description_lines.append(match.group(1).strip())
+        quantity = match.group(2)
+        unit_price = match.group(3)
+
+    for line in block[1:]:
+        line = line.strip()
+
+        # Extract order number & date
+        order_match = re.search(r'your order no\.\s*(\d+)\s*-\s*(\d{2}\.\d{2}\.\d{4})', line, re.I)
+        if order_match:
+            order_number, order_date = order_match.groups()
+            continue
+
+        # Extract art number
+        art_match = re.search(r'your art\.-no\.\s*:\s*([A-Za-z0-9-]+)', line, re.I)
+        if art_match:
+            art_number = art_match.group(1)
+            continue
+
+        # Extract lot number
+        lot_match = re.search(r'lot number[:\s]+([A-Za-z0-9/-]+)', line, re.I)
+        if lot_match:
+            lot_number = lot_match.group(1)
+            continue
+
+        # Otherwise treat as description continuation
+        if line and not re.match(r'^\d+\s+[A-Z0-9/-]+', line):
+            description_lines.append(line)
+
+    description = " ".join(description_lines).strip()
+
+    return {
+        "invoice_number": invoice_data.get("invoice_number", ""),
+        "invoice_date": invoice_data.get("invoice_date", ""),
+        "customer_number": invoice_data.get("customer_number", ""),
+        "order_number": order_number,
+        "order_date": order_date,
+        "delivery_note": invoice_data.get("delivery_note", ""),
+        "art_number": art_number,
+        "lot_number": lot_number,
+        "description": description,
+        "quantity": quantity,
+        "unit_price": unit_price,
+        "page_number": page_num + 1
+    }
+
+
+#SGS North America
+def extract_sgs_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from SGS North America invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            invoice_data = _extract_sgs_invoice_info(lines)
+
+            in_items_section = False
+            item_blocks = []
+
+            for line in lines:
+                line_clean = line.strip()
+
+                # Start when we hit the column headers
+                if re.search(r'Quantity\s+Net Amount\s+Amount', line_clean, re.I):
+                    in_items_section = True
+                    continue
+                if not in_items_section:
+                    continue
+
+                # Stop when we reach summary section
+                if re.search(r'Sub-Total|Net \$|Total', line_clean, re.I):
+                    break
+
+                # Skip empty or irrelevant lines
+                if not line_clean or "Alternative Currency" in line_clean:
+                    continue
+
+                item_blocks.append((line_clean, invoice_data.copy()))
+
+            # Parse item lines
+            for block, inv_data in item_blocks:
+                item_data = _parse_sgs_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+
+    return extracted_data
+
+def _extract_sgs_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice-level info from SGS North America invoices."""
+    invoice_data = {
+        "invoice_number": "",
+        "invoice_date": "",
+        "client_name": "",
+        "account_number": "",
+        "our_reference": "",
+        "client_reference": "",
+        "po_number": ""
+    }
+
+    for line in lines:
+        line_clean = line.strip()
+
+        inv_match = re.search(r'INVOICE No[:\s]+(\d+)', line_clean, re.I)
+        if inv_match:
+            invoice_data["invoice_number"] = inv_match.group(1)
+
+        date_match = re.search(r'Issue Date\s*:\s*(.+)', line_clean, re.I)
+        if date_match:
+            invoice_data["invoice_date"] = date_match.group(1).strip()
+
+        client_match = re.search(r'Client\s+(.+)', line_clean, re.I)
+        if client_match and not invoice_data["client_name"]:
+            invoice_data["client_name"] = client_match.group(1).strip()
+
+        acct_match = re.search(r'Account No\.\s*:\s*([^\s]+)', line_clean, re.I)
+        if acct_match:
+            invoice_data["account_number"] = acct_match.group(1)
+
+        ref_match = re.search(r'Our Refer\. No\.\s*:\s*(.+)', line_clean, re.I)
+        if ref_match:
+            invoice_data["our_reference"] = ref_match.group(1).strip()
+
+        client_ref_match = re.search(r'Client Ref No\.\s*:\s*(.+)', line_clean, re.I)
+        if client_ref_match:
+            invoice_data["client_reference"] = client_ref_match.group(1).strip()
+
+        po_match = re.search(r'PO No\.\s*:\s*(.+)', line_clean, re.I)
+        if po_match:
+            invoice_data["po_number"] = po_match.group(1).strip()
+
+    return invoice_data
+
+def _parse_sgs_item_block(line: str, invoice_data: Dict, page_num: int) -> Dict:
+    """
+    Parse a single SGS invoice item line into structured data.
+    """
+    item_data = invoice_data.copy()
+    item_data["page"] = page_num + 1
+
+    # Example line:
+    # "Aug 16, 2022 - Surveillance Audit (10) 1.50 3,150.00 3,150.00"
+    match = re.match(r"(.+?)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)$", line)
+    if match:
+        desc, qty, net, total = match.groups()
+        item_data.update({
+            "description": desc.strip(),
+            "quantity": qty.strip(),
+            "net": net.strip(),
+            "total": total.strip(),
+        })
+        return item_data
+
+    # Expenses like "Taxi 112.28 112.28"
+    match = re.match(r"(Taxi|Meal|Hotel|Rental Car|Flights)\s+([\d.,]+)\s+([\d.,]+)$", line, re.I)
+    if match:
+        desc, net, total = match.groups()
+        item_data.update({
+            "description": desc.strip(),
+            "quantity": "1",  # implied
+            "net": net.strip(),
+            "total": total.strip(),
+        })
+        return item_data
+
+    # Page 2 extras: "Processing Fee 7.5% 123.82 123.82"
+    match = re.match(r"(Processing Fee.*?|Reporting.*?)\s+([\d.,]+)\s+([\d.,]+)$", line, re.I)
+    if match:
+        desc, net, total = match.groups()
+        item_data.update({
+            "description": desc.strip(),
+            "quantity": "1",  # implied
+            "net": net.strip(),
+            "total": total.strip(),
+        })
+        return item_data
+
+    return None
+
+
+#SIBEL
+def extract_sibel_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from SIBEL invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            invoice_data = _extract_sibel_invoice_info(lines)
+
+            in_items_section = False
+            item_blocks = []
+
+            for line in lines:
+                line_clean = line.strip()
+
+                # Start when we hit the column headers
+                if re.search(r'Pos\.\s+Item N°\s+Description', line_clean, re.I):
+                    in_items_section = True
+                    continue
+                if not in_items_section:
+                    continue
+
+                # Stop when we reach totals
+                if re.search(r'Total ExVAT|VAT|Total InVAT', line_clean, re.I):
+                    break
+
+                if not line_clean:
+                    continue
+
+                item_blocks.append((line_clean, invoice_data.copy()))
+
+            # Parse each item block
+            for block, inv_data in item_blocks:
+                item_data = _parse_sibel_item_block(block, inv_data, page_num, text)
+                if item_data:
+                    extracted_data.append(item_data)
+
+    return extracted_data
+
+def _extract_sibel_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice-level info from SIBEL invoices."""
+    invoice_data = {
+        "invoice_number": "",
+        "invoice_date": ""
+    }
+
+    for line in lines:
+        line_clean = line.strip()
+
+        inv_match = re.search(r'N°\s+(\d+)', line_clean, re.I)
+        if inv_match:
+            invoice_data["invoice_number"] = inv_match.group(1)
+
+        date_match = re.search(r'Date\s+(\d{2}/\d{2}/\d{4})', line_clean, re.I)
+        if date_match:
+            invoice_data["invoice_date"] = date_match.group(1)
+
+    return invoice_data
+
+def _parse_sibel_item_block(line: str, invoice_data: Dict, page_num: int, full_text: str) -> Dict:
+    """
+    Parse a single SIBEL invoice item line.
+    Example:
+    "1 18-2-0176-0010 DEBAKEY MICRO CLAMP... 1 1 510,88 510,88"
+    """
+    item_data = invoice_data.copy()
+    item_data["page"] = page_num + 1
+
+    # Regex: Pos, ItemNo, Description, Qty, Unit, UnitPrice, Total
+    match = re.match(
+        r"(\d+)\s+([\w\-]+)\s+(.+?)\s+(\d+)\s+([\w]+)\s+([\d,]+)\s+([\d,]+)$",
+        line
+    )
+    if match:
+        pos, item_no, desc, qty, unit, unit_price, total = match.groups()
+        item_data.update({
+            "item_number": item_no.strip(),
+            "description": desc.strip(),
+            "quantity": qty.strip(),
+            "unit": unit.strip(),
+            "unit_price": unit_price.strip()
+        })
+
+        # Optional: Article Reference
+        art_no_match = re.search(r"Your article ref\.\s*:\s*([A-Za-z0-9\-\/]+)", full_text, re.I)
+        if art_no_match:
+            item_data["article_number"] = art_no_match.group(1)
+
+        # Optional: Lot Number
+        lot_match = re.search(r"LOT\s*:\s*([A-Za-z0-9\-\/]+)", full_text, re.I)
+        if lot_match:
+            item_data["lot_number"] = lot_match.group(1)
+
+        return item_data
+
+    return None
+
+
+#Siema
+def extract_siema_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Siema (Siegfried Martin) invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data: List[Dict] = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            invoice_info = _extract_siema_invoice_info(lines)
+
+            in_items_section = False
+            current_block: List[str] = []
+            item_blocks: List[tuple] = []
+
+            # context that applies to subsequent items until changed
+            current_order = ""
+            current_order_date = ""
+            current_lst = ""
+            current_ref = ""
+
+            for line in lines:
+                line_clean = line.strip()
+
+                # detect start of the items table
+                if re.search(r'POS\s+ARTICLE\s+description', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                if not in_items_section:
+                    continue
+
+                # stop parsing when totals appear
+                if re.search(r'total\s+net|total/EUR|total\/EUR', line_clean, re.IGNORECASE):
+                    if current_block:
+                        inv_copy = invoice_info.copy()
+                        inv_copy['order_number'] = current_order
+                        inv_copy['order_date'] = current_order_date
+                        inv_copy['lst_number'] = current_lst
+                        inv_copy['ref_no'] = current_ref
+                        item_blocks.append((current_block, inv_copy))
+                        current_block = []
+                    break
+
+                # update order context
+                ord_match = re.search(r'your order no\.\s*(\d+)\s*-\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+                if ord_match:
+                    current_order, current_order_date = ord_match.groups()
+                    continue
+
+                # update LST and ref context (these usually appear before item lines)
+                lst_match = re.search(r'\bLST[:\s]*([A-Za-z0-9 \-\/]+)', line_clean, re.IGNORECASE)
+                if lst_match:
+                    current_lst = lst_match.group(1).strip()
+                    continue
+
+                ref_match = re.search(r'your ref\.no\.\s*[:\s]*([A-Za-z0-9\-\/]+)', line_clean, re.IGNORECASE)
+                if ref_match:
+                    current_ref = ref_match.group(1).strip()
+                    continue
+
+                # handle carry-over: finalize block and keep parsing
+                if re.search(r'carry-over', line_clean, re.IGNORECASE):
+                    if current_block:
+                        inv_copy = invoice_info.copy()
+                        inv_copy['order_number'] = current_order
+                        inv_copy['order_date'] = current_order_date
+                        inv_copy['lst_number'] = current_lst
+                        inv_copy['ref_no'] = current_ref
+                        item_blocks.append((current_block, inv_copy))
+                        current_block = []
+                    continue
+
+                # detect item start lines: e.g. "1 SM ... 5 59,15 295,75"
+                if re.match(r'^\d+\s+SM\b.*\s+\d+\s+[\d\.,]+\s+[\d\.,]+$', line_clean):
+                    if current_block:
+                        inv_copy = invoice_info.copy()
+                        inv_copy['order_number'] = current_order
+                        inv_copy['order_date'] = current_order_date
+                        inv_copy['lst_number'] = current_lst
+                        inv_copy['ref_no'] = current_ref
+                        item_blocks.append((current_block, inv_copy))
+                    current_block = [line_clean]
+                    continue
+
+                # continuation lines for the current item
+                if current_block and line_clean:
+                    current_block.append(line_clean)
+
+            # append any final block left
+            if current_block:
+                inv_copy = invoice_info.copy()
+                inv_copy['order_number'] = current_order
+                inv_copy['order_date'] = current_order_date
+                inv_copy['lst_number'] = current_lst
+                inv_copy['ref_no'] = current_ref
+                item_blocks.append((current_block, inv_copy))
+
+            # parse item blocks
+            for block, inv_data in item_blocks:
+                item_data = _parse_siema_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+
+    return extracted_data
+
+def _extract_siema_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice-level metadata from Siema invoice (invoice number, date, cust-no)."""
+    invoice_data = {
+        "invoice_number": "",
+        "invoice_date": "",
+        "customer_number": ""
+    }
+
+    for line in lines:
+        lc = line.strip()
+
+        inv_match = re.search(r'INVOICE NO\.\s*:\s*([A0-9-]+)', lc, re.IGNORECASE)
+        if inv_match and not invoice_data["invoice_number"]:
+            invoice_data["invoice_number"] = inv_match.group(1).strip()
+
+        date_match = re.search(r'Date\s*:\s*(\d{2}\.\d{2}\.\d{4})', lc, re.IGNORECASE)
+        if date_match and not invoice_data["invoice_date"]:
+            invoice_data["invoice_date"] = date_match.group(1).strip()
+
+        cust_match = re.search(r'Cust\.-No\.\s*:\s*([0-9\-]+)', lc, re.IGNORECASE)
+        if cust_match and not invoice_data["customer_number"]:
+            invoice_data["customer_number"] = cust_match.group(1).strip()
+
+    return invoice_data
+
+def _parse_siema_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """
+    Parse a multi-line Siema item block and return a dict.
+
+    Expected block example:
+      [
+        '1 SM Diethrich-Hegemann Scissors 13.5 cm, 5 59,15 295,75',
+        '0402-13.5/600 laterally angled, 60 degrees,',
+        'sharp, round',
+        'satin finish crosswise/satin finish crosswise',
+        'Lot number 91312',
+        'Drawing No./versionZG X402-13.5 / E'
+      ]
+    """
+    if not block:
+        return None
+
+    out = {
+        "invoice_number": invoice_data.get("invoice_number", ""),
+        "invoice_date": invoice_data.get("invoice_date", ""),
+        "customer_number": invoice_data.get("customer_number", ""),
+        "order_number": invoice_data.get("order_number", ""),
+        "order_date": invoice_data.get("order_date", ""),
+        "lst_number": invoice_data.get("lst_number", ""),
+        "ref_no": invoice_data.get("ref_no", ""),
+        "item_number": "",
+        "description": "",
+        "quantity": "",
+        "unit_price": "",
+        "lot_number": "",
+        "page": page_num + 1
+    }
+
+    first_line = block[0].strip()
+
+    # Extract trailing qty and unit price from first line (we ignore line-total)
+    tail_match = re.search(r'(\d+)\s+([\d\.,]+)\s+[\d\.,]+\s*$', first_line)
+    if tail_match:
+        qty = tail_match.group(1)
+        unit_price_raw = tail_match.group(2)
+        # normalize German-style numbers to dot-decimal (e.g. "59,15" -> "59.15", "1.086,12"->"1086.12")
+        unit_price_norm = unit_price_raw.replace('.', '').replace(',', '.') if ('.' in unit_price_raw and ',' in unit_price_raw) else unit_price_raw.replace(',', '.')
+        out['quantity'] = qty
+        out['unit_price'] = unit_price_norm
+        left = first_line[:tail_match.start()].strip()
+    else:
+        # fallback if qty/price not found
+        left = re.sub(r'^\d+\s+SM\s+', '', first_line, flags=re.IGNORECASE).strip()
+
+    # remove leading position + "SM" token if present
+    left = re.sub(r'^\d+\s+SM\s+', '', left, flags=re.IGNORECASE).strip()
+    description_parts: List[str] = [left] if left else []
+
+    # Try inline item number (Case 2), e.g. "5 SM 0754/600 ..."
+    inline_match = re.search(r'\bSM\s+([0-9]{2,5}(?:[-/][\dA-Za-z\.\-/]+)?)', first_line, re.IGNORECASE)
+    if inline_match:
+        code = inline_match.group(1).strip()
+        out['item_number'] = f"SM {code}"
+        # remove code from description if it remained
+        description_parts = [re.sub(re.escape(code), '', p, flags=re.IGNORECASE).strip() for p in description_parts]
+
+    # scan continuation lines to find item-number on next line (Case 1), ref_no, lst, lot, drawing, etc.
+    for i, ln in enumerate(block[1:], start=1):
+        ln_strip = ln.strip()
+
+        # LST inside block (rare) - override invoice-level if present
+        lst_m = re.search(r'\bLST[:\s]*([A-Za-z0-9 \-\/]+)', ln_strip, re.IGNORECASE)
+        if lst_m:
+            out['lst_number'] = lst_m.group(1).strip()
+            continue
+
+        # reference number inside block (rare) - override
+        ref_m = re.search(r'your ref\.no\.\s*[:\s]*([A-Za-z0-9\-\/]+)', ln_strip, re.IGNORECASE)
+        if ref_m:
+            out['ref_no'] = ref_m.group(1).strip()
+            continue
+
+        # lot number
+        lot_m = re.search(r'Lot\s*number\s*[:\s]*([A-Za-z0-9\-/]+)', ln_strip, re.IGNORECASE)
+        if lot_m:
+            out['lot_number'] = lot_m.group(1).strip()
+            continue
+
+        # Case 1: second line starts with item code like "0402-13.5/600 ..."
+        itemnum_m = re.match(r'^([0-9]{2,5}[-/][\dA-Za-z\.\-/]+)\b(.*)$', ln_strip)
+        if itemnum_m and not out['item_number']:
+            code = itemnum_m.group(1).strip()
+            rest = itemnum_m.group(2).strip()
+            out['item_number'] = f"SM {code}"
+            if rest:
+                description_parts.append(rest)
+            continue
+
+        # If a line starts with something like "0402-13.5/600" that got split differently, handle it
+        itemnum_loose = re.search(r'([0-9]{2,5}[-/][\dA-Za-z\.\-/]+)', ln_strip)
+        if itemnum_loose and not out['item_number']:
+            # be conservative: accept only if it's near start
+            if ln_strip.startswith(itemnum_loose.group(1)):
+                out['item_number'] = f"SM {itemnum_loose.group(1).strip()}"
+                rest = ln_strip.replace(itemnum_loose.group(1), '').strip()
+                if rest:
+                    description_parts.append(rest)
+                continue
+
+        # skip known meta-lines that we do not want in description
+        if re.search(r'Customs tariff|Country of origin|special item|carry-over', ln_strip, re.IGNORECASE):
+            continue
+
+        # drawing line -> include in description
+        if re.search(r'Drawing\s+No\.', ln_strip, re.IGNORECASE):
+            description_parts.append(ln_strip)
+            continue
+
+        # otherwise treat as description continuation
+        description_parts.append(ln_strip)
+
+    # Finalize description
+    description_clean = " - ".join([p for p in description_parts if p]).strip()
+    out['description'] = re.sub(r'\s+', ' ', description_clean).strip()
+
+    # Only return if we have essential data
+    if out['quantity'] and out['description']:
+        return out
+
+    return None
+
+
+#SignTech
+def extract_sigtech_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from SignTech invoice format (SignTech).
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data: List[Dict] = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            invoice_data = _extract_sigtech_invoice_info(lines)
+
+            in_items_section = False
+            current_block: List[str] = []
+            item_blocks: List[tuple] = []
+
+            for line in lines:
+                line_clean = line.strip()
+
+                # detect start of items table by column header row
+                if re.search(r'qty\.\s+ord\s+qty\.\s+ship\.|qty\.\s+ord\s+qty\.', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                if not in_items_section:
+                    continue
+
+                # stop when totals appear
+                if re.search(r'Sales Amt\.|Total/\$|Total \$', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                        current_block = []
+                    break
+
+                # detect item start:
+                # e.g. "3 3 0 EACH G1080-76 three-way luer-lock, ... 58.00 174.00"
+                if re.match(r'^\d+\s+\d+\s+\d+\s+\S+\s+[A-Z0-9-]+\b', line_clean):
+                    # finalize previous
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = [line_clean]
+                    continue
+
+                # continuation lines (description, Lot No., Country of origin)
+                if current_block and line_clean:
+                    current_block.append(line_clean)
+
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy()))
+
+            # parse blocks
+            for block, inv_data in item_blocks:
+                item_data = _parse_sigtech_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+
+    return extracted_data
+
+def _extract_sigtech_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """
+    Extract invoice-level info for SignTech invoices.
+    Returns dict with keys:
+      invoice_number, invoice_date, order_number, order_date,
+      customer_number, customer_po, purchase_order_no, ship_date, ship_via
+    """
+    invoice_data = {
+        "invoice_number": "",
+        "invoice_date": "",
+        "order_number": "",
+        "order_date": "",
+        "customer_number": "",
+        "customer_po": "",
+        "purchase_order_no": "",
+        "ship_date": "",
+        "ship_via": ""
+    }
+
+    for i, line in enumerate(lines):
+        lc = line.strip()
+
+        # Line that follows header "INVOICE DATE INVOICE NO. PAGE"
+        m_date_no = re.match(r'^\s*(\d{1,2}/\d{1,2}/\d{4})\s+(\d+)\s+\d+', lc)
+        if m_date_no:
+            invoice_data["invoice_date"] = m_date_no.group(1)
+            invoice_data["invoice_number"] = m_date_no.group(2)
+            continue
+
+        # The ORDER line containing many fields (Order No, Order Date, Customer No, Customer P.O., Purchase Order No, Ship Date, Ship Via)
+        # e.g. "32850 4/29/2024 12146 0016497 0016497 4/29/2024 UPS Ground"
+        m_orderline = re.match(
+            r'^\s*(\d+)\s+(\d{1,2}/\d{1,2}/\d{4})\s+(\d+)\s+([^\s]+)\s+([^\s]+)\s+(\d{1,2}/\d{1,2}/\d{4})\s+(.+)$',
+            lc
+        )
+        if m_orderline:
+            invoice_data["order_number"] = m_orderline.group(1)
+            invoice_data["order_date"] = m_orderline.group(2)
+            invoice_data["customer_number"] = m_orderline.group(3)
+            invoice_data["customer_po"] = m_orderline.group(4)
+            invoice_data["purchase_order_no"] = m_orderline.group(5)
+            invoice_data["ship_date"] = m_orderline.group(6)
+            invoice_data["ship_via"] = m_orderline.group(7).strip()
+            continue
+
+        # fallback: small variations like extra whitespace or missing fields
+        # try to catch "ORDER NO." header followed by data on next line
+        if re.search(r'ORDER NO\.', lc, re.IGNORECASE) and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            m = re.match(r'^\s*(\d+)\s+(\d{1,2}/\d{1,2}/\d{4})\s+(\d+)\s+([^\s]+)\s+([^\s]+)\s+(\d{1,2}/\d{1,2}/\d{4})\s+(.+)$', next_line)
+            if m:
+                invoice_data["order_number"] = m.group(1)
+                invoice_data["order_date"] = m.group(2)
+                invoice_data["customer_number"] = m.group(3)
+                invoice_data["customer_po"] = m.group(4)
+                invoice_data["purchase_order_no"] = m.group(5)
+                invoice_data["ship_date"] = m.group(6)
+                invoice_data["ship_via"] = m.group(7).strip()
+
+    return invoice_data
+
+def _parse_sigtech_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """
+    Parse a SignTech item block (multi-line).
+    Returns structured dict with invoice + item details.
+    """
+    if not block:
+        return None
+
+    out: Dict[str, str] = {
+        "invoice_number": invoice_data.get("invoice_number", ""),
+        "invoice_date": invoice_data.get("invoice_date", ""),
+        "order_number": invoice_data.get("order_number", ""),
+        "order_date": invoice_data.get("order_date", ""),
+        "customer_number": invoice_data.get("customer_number", ""),
+        "customer_po": invoice_data.get("customer_po", ""),
+        "purchase_order_no": invoice_data.get("purchase_order_no", ""),
+        "ship_date": invoice_data.get("ship_date", ""),
+        "ship_via": invoice_data.get("ship_via", ""),
+        "qty_ordered": "",
+        "qty_shipped": "",
+        "qty_backorder": "",
+        "unit": "",
+        "item_number": "",
+        "description": "",
+        "unit_price": "",
+        "ext_price": "",
+        "lot_number": "",
+        "country_of_origin": "",
+        "page": page_num + 1
+    }
+
+    first_line = block[0].strip()
+    description_parts: List[str] = []
+
+    # primary pattern: qtys, unit, item_no, description, prices
+    m = re.match(
+        r'^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+([A-Z0-9-]+)\s+(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*$',
+        first_line
+    )
+    if m:
+        out['qty_ordered'] = m.group(1)
+        out['qty_shipped'] = m.group(2)
+        out['qty_backorder'] = m.group(3)
+        out['unit'] = m.group(4)
+        out['item_number'] = m.group(5)
+        desc_fragment = m.group(6).strip()
+        out['unit_price'] = m.group(7).replace(',', '')
+        out['ext_price'] = m.group(8).replace(',', '')
+        description_parts.append(desc_fragment)
+    else:
+        # fallback: try extracting trailing prices
+        combined = " ".join(block)
+        tail = re.search(r'([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*$', combined)
+        if tail:
+            out['unit_price'] = tail.group(1).replace(',', '')
+            out['ext_price'] = tail.group(2).replace(',', '')
+            head = combined[:tail.start()].strip()
+            head_first_line = head.splitlines()[0]
+            m2 = re.match(r'^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+([A-Z0-9-]+)\s*(.*)$', head_first_line)
+            if m2:
+                out['qty_ordered'] = m2.group(1)
+                out['qty_shipped'] = m2.group(2)
+                out['qty_backorder'] = m2.group(3)
+                out['unit'] = m2.group(4)
+                out['item_number'] = m2.group(5)
+                description_parts.append(m2.group(6).strip())
+                description_parts += head.splitlines()[1:]
+            else:
+                description_parts.append(head)
+        else:
+            description_parts.append(first_line)
+
+    # handle continuation lines
+    for ln in block[1:]:
+        ln_s = ln.strip()
+        lot_m = re.search(r'Lot\s*No\.?\s*[:\s]*([A-Za-z0-9\-]+)', ln_s, re.IGNORECASE)
+        if lot_m:
+            out['lot_number'] = lot_m.group(1).strip()
+            continue
+        co_m = re.search(r'Country of origin[:\s]*([A-Za-z ]+)', ln_s, re.IGNORECASE)
+        if co_m:
+            out['country_of_origin'] = co_m.group(1).strip()
+            continue
+        description_parts.append(ln_s)
+
+    # finalize description
+    desc_clean = " - ".join([d for d in description_parts if d])
+    desc_clean = re.sub(r'\s+', ' ', desc_clean).strip()
+    out['description'] = desc_clean
+
+    # Defensive: check that at least item number + some qty exist
+    if out['item_number'] and not (out['qty_ordered'] or out['qty_shipped'] or out['qty_backorder']):
+        # still allow but loggable point – qtys missing
+        pass
+
+    # Must have at least item_number + description
+    if out['item_number'] and out['description']:
+        return out
+
+    return None
+
+
+#Simmank OCR Needed
+
+#SIS
+def extract_sis_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from SIS invoice format.
+    Returns list of dicts (one per item line).
+    """
+    extracted_data: List[Dict] = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            invoice_data = _extract_sis_invoice_info(lines)
+
+            in_items_section = False
+            current_block: List[str] = []
+            item_blocks: List[tuple] = []
+
+            for line in lines:
+                line_clean = line.strip()
+
+                # detect start of items table
+                if re.search(r'^Item\s+Qty\.\s+Price\s+Ext\.?', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                if not in_items_section:
+                    continue
+
+                # stop when totals appear
+                if re.search(r'Subtotal|Total Due', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                        current_block = []
+                    break
+
+                # item line: description ending with qty + price + ext
+                if re.match(r'^.+\s+\d+\s+\$\d+[\d,]*\.\d{2}\s+\$\d+[\d,]*\.\d{2}$', line_clean):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = [line_clean]
+                    continue
+
+                # continuation line (e.g. "Labor Hour to refinish...")
+                if current_block and line_clean:
+                    current_block.append(line_clean)
+
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy()))
+
+            # parse item blocks
+            for block, inv_data in item_blocks:
+                item_data = _parse_sis_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+
+    return extracted_data
+
+def _extract_sis_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """
+    Extract invoice-level info for SIS invoices.
+    """
+    invoice_data = {
+        "invoice_number": "",
+        "invoice_date": "",
+        "po_number": "",
+        "order_date": "",
+        "ship_date": "",
+        "bill_to": "",
+        "ship_to": ""
+    }
+
+    for i, line in enumerate(lines):
+        lc = line.strip()
+
+        m_ship = re.search(r'Date Shipped\s+\.{5,}\s*([\d/]+)', lc)
+        if m_ship:
+            invoice_data["ship_date"] = m_ship.group(1)
+            continue
+
+        m_inv = re.search(r'Invoice #\s+\.{5,}\s*(\S+)', lc)
+        if m_inv:
+            invoice_data["invoice_number"] = m_inv.group(1)
+            continue
+
+        m_po = re.search(r'P\.O\.\s+\.{5,}\s*(\S+)', lc)
+        if m_po:
+            invoice_data["po_number"] = m_po.group(1)
+            continue
+
+        m_order = re.search(r'Order Date\s+\.{5,}\s*([\d/]+)', lc)
+        if m_order:
+            invoice_data["order_date"] = m_order.group(1)
+            continue
+
+        # Bill To / Ship To block
+        if lc.startswith("Bill To:"):
+            bill_lines, ship_lines = [], []
+            # join next few lines until dashed separator
+            j = i + 1
+            while j < len(lines) and not re.match(r'^[_]{5,}', lines[j]):
+                if "Ship To:" in lines[j]:
+                    j += 1
+                    continue
+                if "NOVO" in lines[j] or "USA" in lines[j] or "DRIVE" in lines[j]:
+                    # heuristic: alternate bill vs ship based on indent
+                    if "Ship" in lines[i]:
+                        ship_lines.append(lines[j].strip())
+                    else:
+                        bill_lines.append(lines[j].strip())
+                j += 1
+            invoice_data["bill_to"] = " ".join(bill_lines).strip()
+            invoice_data["ship_to"] = " ".join(ship_lines).strip()
+
+    return invoice_data
+
+def _parse_sis_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """
+    Parse SIS item block into structured dict.
+    """
+    if not block:
+        return None
+
+    out: Dict[str, str] = {
+        "invoice_number": invoice_data.get("invoice_number", ""),
+        "invoice_date": invoice_data.get("invoice_date", ""),
+        "po_number": invoice_data.get("po_number", ""),
+        "order_date": invoice_data.get("order_date", ""),
+        "ship_date": invoice_data.get("ship_date", ""),
+        "bill_to": invoice_data.get("bill_to", ""),
+        "ship_to": invoice_data.get("ship_to", ""),
+        "description": "",
+        "quantity": "",
+        "unit_price": "",
+        "ext_price": "",
+        "page": page_num + 1
+    }
+
+    first_line = block[0].strip()
+    # e.g. "Retractor Blade 1 $85.00 $85.00"
+    m = re.match(r'^(.+?)\s+(\d+)\s+\$([\d,]+\.\d{2})\s+\$([\d,]+\.\d{2})$', first_line)
+    if m:
+        out["description"] = m.group(1).strip()
+        out["quantity"] = m.group(2)
+        out["unit_price"] = m.group(3).replace(",", "")
+        out["ext_price"] = m.group(4).replace(",", "")
+
+    # append continuation lines to description
+    for ln in block[1:]:
+        out["description"] += " - " + ln.strip()
+
+    return out if out["description"] else None
+
+
+#Sitec
+def extract_sitec_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Sitec invoice format.
+    Returns list of dicts (one per item line).
+    """
+    extracted_data: List[Dict] = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            invoice_data = _extract_sitec_invoice_info(lines)
+
+            in_items_section = False
+            current_block: List[str] = []
+            item_blocks: List[tuple] = []
+
+            for line in lines:
+                line_clean = line.strip()
+
+                # detect start of items table
+                if re.search(r'^S\.\#\s+Product Description', line_clean, re.IGNORECASE):
+                    in_items_section = True
+                    continue
+                if not in_items_section:
+                    continue
+
+                # stop at totals
+                if re.search(r'^TOTAL PIECES', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                        current_block = []
+                    break
+
+                # detect item start (serial # + item number)
+                if re.match(r'^\d+\s+[A-Z0-9-]+', line_clean):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = [line_clean]
+                    continue
+
+                # continuation lines: description, LST
+                if current_block and line_clean:
+                    current_block.append(line_clean)
+
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy()))
+
+            # parse item blocks
+            for block, inv_data in item_blocks:
+                item_data = _parse_sitec_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+
+    return extracted_data
+
+def _extract_sitec_invoice_info(lines: List[str]) -> Dict[str, str]:
+    invoice_data = {
+        "invoice_number": "",
+        "invoice_date": "",
+        "country_of_origin": "PAKISTAN"  # default as per samples
+    }
+
+    for line in lines:
+        lc = line.strip()
+        m_inv = re.search(r'INVOICE NO\.\s*(\S+)', lc, re.IGNORECASE)
+        if m_inv:
+            invoice_data["invoice_number"] = m_inv.group(1).strip()
+            continue
+        m_date = re.search(r'DATE[:\s]+(\d{1,2}/\d{1,2}/\d{2,4})', lc, re.IGNORECASE)
+        if m_date:
+            invoice_data["invoice_date"] = m_date.group(1).strip()
+            continue
+        m_country = re.search(r'Country of Origin[:\s]*(\S+)', lc, re.IGNORECASE)
+        if m_country:
+            invoice_data["country_of_origin"] = m_country.group(1).strip()
+            continue
+
+    return invoice_data
+
+def _parse_sitec_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """
+    Parse Sitec item block (multi-line) into structured dict.
+    Removed columns: ext_price, serial_number, country_of_origin
+    """
+    if not block:
+        return None
+
+    out: Dict[str, str] = {
+        "invoice_number": invoice_data.get("invoice_number", ""),
+        "invoice_date": invoice_data.get("invoice_date", ""),
+        "item_number": "",
+        "description": "",
+        "order_number": "",
+        "quantity": "",
+        "unit_price": "",
+        "lst_number": "",
+        "page": page_num + 1
+    }
+
+    # first line contains item_number, description, order#, qty, unit_price
+    first_line = block[0].strip()
+
+    # pattern: item_number description order# qty unit_price ext_price
+    m = re.match(
+        r'^\d+\s+([A-Z0-9-]+)\s+(.+?)\s+(\d+)\s+(\d+)\s+([\d,]+\.\d{2})',
+        first_line
+    )
+    if m:
+        out["item_number"] = m.group(1)
+        out["description"] = m.group(2).strip()
+        out["order_number"] = m.group(3)
+        out["quantity"] = m.group(4)
+        out["unit_price"] = m.group(5).replace(",", "")
+    else:
+        # fallback parsing
+        tokens = first_line.split()
+        if len(tokens) >= 6:
+            out["item_number"] = tokens[1]
+            out["order_number"] = tokens[-3]
+            out["quantity"] = tokens[-2]
+            out["unit_price"] = tokens[-1].replace(",", "")
+            desc_tokens = tokens[2:-3]
+            out["description"] = " ".join(desc_tokens)
+
+    # continuation lines: description or LST
+    for ln in block[1:]:
+        ln_s = ln.strip()
+        if ln_s.upper().startswith("LST"):
+            out["lst_number"] = ln_s
+        else:
+            out["description"] += " - " + ln_s
+
+    return out if out["item_number"] else None
+
+
+#SMT
+def extract_smt_invoice_data(pdf_content: bytes) -> List[Dict]:
+    extracted_data: List[Dict] = []
+
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+            lines = text.split("\n")
+            invoice_info = _extract_smt_invoice_info(lines)
+
+            current_block: List[str] = []
+            item_blocks: List[List[str]] = []
+
+            in_items_section = False
+            for line in lines:
+                line_clean = line.strip()
+
+                # Start of items section
+                if re.search(r'POS\s+ARTICLE\s+Description', line_clean):
+                    in_items_section = True
+                    continue
+                if not in_items_section:
+                    continue
+
+                # Stop at totals
+                if re.search(r'TOTAL PIECES|Total/EUR|Value of goods', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append(current_block)
+                        current_block = []
+                    break
+
+                # Detect new item start (lines like "1 13-01-20-1800-10P")
+                if re.match(r'^\d+\s+[A-Z0-9\-]', line_clean):
+                    if current_block:
+                        item_blocks.append(current_block)
+                    current_block = [line_clean]
+                elif current_block:
+                    current_block.append(line_clean)
+
+            if current_block:
+                item_blocks.append(current_block)
+
+            # Parse items
+            for block in item_blocks:
+                item_data = _parse_smt_item_block(block, invoice_info, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+
+    return extracted_data
+
+def _extract_smt_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """
+    Extract invoice-level info (invoice number, invoice date, order number/date, LST number)
+    """
+    info = {
+        "invoice_number": "",
+        "invoice_date": "",
+        "order_number": "",
+        "order_date": "",
+        "lst_number": ""
+    }
+
+    for line in lines:
+        line_clean = line.strip()
+
+        # Invoice number: "INVOICE NO. : 436413"
+        m_invoice = re.search(r'INVOICE NO\.?\s*:\s*([A-Z0-9\-]+)', line_clean, re.IGNORECASE)
+        if m_invoice and not info["invoice_number"]:
+            info["invoice_number"] = m_invoice.group(1).strip()
+            continue
+
+        # Invoice date: "Date : 17.09.2024"
+        m_inv_date = re.search(r'Date\s*:\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if m_inv_date and not info["invoice_date"]:
+            info["invoice_date"] = m_inv_date.group(1).strip()
+            continue
+
+        # Order number and order date: "Your order no. 0017037 - 13.09.2024"
+        # FIXED: Removed the colon that doesn't exist in the actual text
+        m_order = re.search(r'Your order no\.?\s*([A-Z0-9\-]+)\s*-\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if m_order and not info["order_number"]:
+            info["order_number"] = m_order.group(1).strip()
+            info["order_date"] = m_order.group(2).strip()
+            continue
+
+        # LST number: "LST Reg. No.: D104403 / 87 LXH"
+        if "LST Reg. No." in line_clean:
+            lst_m = re.search(r'LST Reg\. No\.?\s*:\s*(.+)', line_clean, re.IGNORECASE)
+            if lst_m and not info["lst_number"]:
+                info["lst_number"] = lst_m.group(1).strip()
+                continue
+
+    return info
+
+def _parse_smt_item_block(block: List[str], invoice_info: Dict[str, str], page_num: int) -> Optional[Dict]:
+    if not block:
+        return None
+
+    out: Dict[str, str] = {
+        "invoice_number": invoice_info.get("invoice_number", ""),
+        "invoice_date": invoice_info.get("invoice_date", ""),
+        "order_number": invoice_info.get("order_number", ""),
+        "order_date": invoice_info.get("order_date", ""),
+        "lst_number": invoice_info.get("lst_number", ""),
+        "item_number": "",
+        "description": "",
+        "quantity": "",
+        "unit_price": "",
+        "total_price": "",
+        "lot_number": "",
+        "page": str(page_num + 1)
+    }
+
+    # Parse first line - examples:
+    # "1 13-01-20-1800-10P Kirschner Bow, Hooks for 10 Pack 8,35 83,50"
+    # "1 13-01-20-1800 kirschner bow, large, 4 pcs. 203,27 813,08"
+    first_line = block[0].strip()
+    
+    # More flexible pattern to handle different formats
+    # The format is: POS ITEM_NUMBER DESCRIPTION QUANTITY UNIT_PRICE TOTAL_PRICE
+    m = re.match(r'^(\d+)\s+([A-Z0-9\-]+)\s+(.+?)\s+([\d,]+)\s+([\d,]+)\s+([\d,]+)$', first_line)
+    if m:
+        out["item_number"] = m.group(2).strip()
+        out["description"] = m.group(3).strip()
+        out["quantity"] = m.group(4).replace(",", ".")
+        out["unit_price"] = m.group(5).replace(",", ".")
+        out["total_price"] = m.group(6).replace(",", ".")
+    else:
+        # Alternative pattern for when total price might be missing or different spacing
+        parts = first_line.split()
+        if len(parts) >= 5:
+            out["item_number"] = parts[1]
+            
+            # Find where prices start (look for numbers with commas)
+            price_indices = []
+            for i, part in enumerate(parts):
+                if re.match(r'^\d+,\d{2}$', part):
+                    price_indices.append(i)
+            
+            if len(price_indices) >= 2:
+                # Description is everything between item number and first price
+                desc_start = 2
+                desc_end = price_indices[0]
+                out["description"] = ' '.join(parts[desc_start:desc_end])
+                out["quantity"] = parts[price_indices[0]].replace(",", ".")
+                out["unit_price"] = parts[price_indices[1]].replace(",", ".")
+                if len(price_indices) >= 3:
+                    out["total_price"] = parts[price_indices[2]].replace(",", ".")
+
+    # Process continuation lines for lot number and additional description
+    description_parts = [out["description"]] if out["description"] else []
+    
+    for ln in block[1:]:
+        ln_s = ln.strip()
+
+        # Lot number: "Lot number 00981164"
+        lot_m = re.search(r'Lot number\s*([A-Za-z0-9\-/\s]+)', ln_s, re.IGNORECASE)
+        if lot_m and not out["lot_number"]:
+            out["lot_number"] = lot_m.group(1).strip()
+            continue
+
+        # Skip lines that are just "Index: A" or other metadata
+        if re.match(r'Index:\s*[A-Z]', ln_s, re.IGNORECASE):
+            continue
+            
+        # Skip empty lines and price-related lines
+        if ln_s and not re.search(r'Value of goods|Package|Total/EUR', ln_s, re.IGNORECASE):
+            description_parts.append(ln_s)
+
+    # Combine description parts
+    if description_parts:
+        desc_clean = " - ".join([d for d in description_parts if d])
+        desc_clean = re.sub(r'\s+', ' ', desc_clean).strip()
+        out["description"] = desc_clean
+
+    # Only return if we have essential data
+    if out["item_number"] and out["description"] and out["quantity"]:
+        return out
+
+    return None
+
+
+#Spiegel (via Simmank) OCR Needed
+
+#Stengelin
+def extract_stengelin_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Stengelin invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_stengelin_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            current_order_no = ""
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if re.search(r'POS\s+ITEM NO\.\s+Article\s+piece\s+U-Price\s+EUR', line_clean):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Stop at summary sections
+                if re.search(r'item amount|package|total amount/EUR|Country of origin', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no))
+                        current_block = []
+                    break
+                
+                # Look for order number lines
+                order_match = re.search(r'your order no\.\s*([^\s/]+)(?:/(\d{2}\.\d{2}\.\d{4}))?\s*-\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+                if order_match:
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no))
+                        current_block = []
+                    current_order_no = order_match.group(1)
+                    continue
+                
+                # Look for item lines (they start with numbers like "10 03.510-38")
+                if re.match(r'^\d+\s+\d{2}\.\d{3}-\d{2}', line_clean):  # e.g., "10 03.510-38"
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no))
+                    current_block = [line_clean]
+                # Continue collecting description lines for the current item
+                elif current_block and line_clean:
+                    current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy(), current_order_no))
+            
+            # Process each item block
+            for block, inv_data, order_no in item_blocks:
+                item_data = _parse_stengelin_item_block(block, inv_data, order_no, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_stengelin_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Stengelin invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'dev_no': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number: "USA - WESTMONT, IL 60559 I N V O I C E NO. : 4500357"
+        # The invoice number can appear in the middle of the address line
+        inv_match = re.search(r'I N V O I C E\s*NO\.?\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if inv_match and not invoice_data['invoice_number']:
+            invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Extract invoice date: "Date : 25.02.2025"
+        date_match = re.search(r'Date\s*:\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if date_match and not invoice_data['invoice_date']:
+            invoice_data['invoice_date'] = date_match.group(1)
+        
+        # Extract customer number: "Cust.-No. : 12413"
+        cust_match = re.search(r'Cust\.?-No\.?\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if cust_match and not invoice_data['customer_number']:
+            invoice_data['customer_number'] = cust_match.group(1)
+        
+        # Extract DEV number: "DEV-No. 9611278"
+        dev_match = re.search(r'DEV-?No\.?\s*(\d+)', line_clean, re.IGNORECASE)
+        if dev_match and not invoice_data['dev_no']:
+            invoice_data['dev_no'] = dev_match.group(1)
+    
+    return invoice_data
+
+def _parse_stengelin_item_block(block: List[str], invoice_data: Dict, order_no: str, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Stengelin invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'dev_no': invoice_data.get('dev_no', ''),
+        'order_no': order_no,
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'total_price': '',
+        'lot_number': '',
+        'lst_number': '',
+        'page': page_num + 1
+    }
+    
+    # Parse first line: "10 03.510-38 N8821-17 Shoulder Retractor, 38 mm 3 40,57 121,71"
+    first_line = block[0].strip()
+    
+    # Parse the item line
+    item_match = re.search(r'^\d+\s+(\d{2}\.\d{3}-\d{2})\s+([^\s]+)\s+(.+?)\s+(\d+)\s+([\d,]+)\s+([\d,]+)$', first_line)
+    
+    if item_match:
+        item_data['item_code'] = item_match.group(1)  # e.g., "03.510-38"
+        item_data['description'] = item_match.group(3).strip()
+        item_data['quantity'] = item_match.group(4)
+        item_data['unit_price'] = item_match.group(5).replace(',', '.')
+        item_data['total_price'] = item_match.group(6).replace(',', '.')
+    
+    # Alternative pattern for different formatting
+    if not item_data['item_code']:
+        alt_match = re.search(r'^\d+\s+(\d{2}\.\d{3}-\d{2})\s+(.+?)\s+(\d+)\s+([\d,]+)\s+([\d,]+)$', first_line)
+        if alt_match:
+            item_data['item_code'] = alt_match.group(1)
+            item_data['description'] = alt_match.group(2).strip()
+            item_data['quantity'] = alt_match.group(3)
+            item_data['unit_price'] = alt_match.group(4).replace(',', '.')
+            item_data['total_price'] = alt_match.group(5).replace(',', '.')
+    
+    # Extract lot number and LST number from the block
+    for line in block:
+        # Lot number: "lot number 04404842"
+        lot_match = re.search(r'lot number\s*([A-Za-z0-9\-]+)', line, re.IGNORECASE)
+        if lot_match and not item_data['lot_number']:
+            item_data['lot_number'] = lot_match.group(1).strip()
+        
+        # LST number: "LST-NO:: A 337061 - GAD"
+        lst_match = re.search(r'LST-?NO::?\s*(.+)', line, re.IGNORECASE)
+        if lst_match and not item_data['lst_number']:
+            item_data['lst_number'] = lst_match.group(1).strip()
+    
+    # For multi-line descriptions, combine additional lines
+    if len(block) > 1 and item_data['description']:
+        additional_desc = []
+        for i in range(1, len(block)):
+            line = block[i].strip()
+            # Skip lines that contain lot numbers, LST numbers, or other metadata
+            if (line and 
+                not re.search(r'lot number|LST-?NO|Datecode|Package No', line, re.IGNORECASE) and
+                not re.match(r'^\d+\s+\d{2}\.\d{3}-\d{2}', line)):
+                additional_desc.append(line)
+        
+        if additional_desc:
+            item_data['description'] += ' - ' + ' '.join(additional_desc)
+    
+    # Only return if we have essential data and non-zero quantity
+    if (item_data['item_code'] and item_data['description'] and 
+        item_data['quantity'] and item_data['quantity'] != '0'):
+        return item_data
+    
+    return None
+
+
+#Steris 
+def extract_steris_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from STERIS invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_steris_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if 'ORDERED BACK ORD. SHIPPED' in line_clean:
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Stop at summary sections
+                if re.search(r'SHIPPING & HANDLING CHARGES|SUBTOTAL|TAX TOTAL|Visit shop.steris.com', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                        current_block = []
+                    break
+                
+                # Look for item lines (they start with numbers like "1 1.1 30808")
+                if re.match(r'^\d+\s+\d+\.\d+\s+\d+', line_clean):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = [line_clean]
+                # Continue collecting description lines for the current item
+                elif current_block and line_clean:
+                    current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy()))
+            
+            # Process each item block
+            for block, inv_data in item_blocks:
+                item_data = _parse_steris_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_steris_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from STERIS invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'order_no': '',
+        'sales_order_no': '',
+        'ship_date': '',
+        'tracking_number': ''
+    }
+    
+    for i, line in enumerate(lines):
+        line_clean = line.strip()
+        
+        # Extract invoice number: "Phone 440-354-2600 12858942"
+        if 'Phone 440-354-2600' in line_clean and not invoice_data['invoice_number']:
+            # Extract the 8-digit number after the phone number
+            inv_match = re.search(r'Phone 440-354-2600\s*(\d{8})', line_clean)
+            if inv_match:
+                invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Extract invoice date: "20-SEP-24" from the DATE PAGE line
+        if 'DATE PAGE' in line_clean and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            date_match = re.search(r'(\d{2}-[A-Z]{3}-\d{2})', next_line)
+            if date_match and not invoice_data['invoice_date']:
+                date_str = date_match.group(1)
+                # Convert date format
+                month_map = {
+                    'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04',
+                    'MAY': '05', 'JUN': '06', 'JUL': '07', 'AUG': '08',
+                    'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'
+                }
+                try:
+                    day, month, year = date_str.split('-')
+                    if len(year) == 2:
+                        year = '20' + year
+                    invoice_data['invoice_date'] = f"{day}.{month_map.get(month.upper(), '01')}.{year}"
+                except (ValueError, AttributeError):
+                    invoice_data['invoice_date'] = date_str
+        
+        # Extract customer number: "399024" from the CUSTOMER NUMBER line
+        if 'CUSTOMER NUMBER' in line_clean and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            cust_match = re.search(r'(\d+)\s+\d+', next_line)  # "399024 52247"
+            if cust_match and not invoice_data['customer_number']:
+                invoice_data['customer_number'] = cust_match.group(1)
+        
+        # Extract purchase order number: "0017068" from PURCHASE ORDER NUMBER
+        if 'PURCHASE ORDER NUMBER' in line_clean and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            if re.match(r'^\d+$', next_line):
+                invoice_data['order_no'] = next_line
+        
+        # Extract sales order number: "18009881" from SALES ORDER NUMBER
+        if 'SALES ORDER NUMBER' in line_clean and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            if re.match(r'^\d+$', next_line):
+                invoice_data['sales_order_no'] = next_line
+        
+        # Extract ship date: "SHIP DATE 20-SEP-24"
+        if 'SHIP DATE' in line_clean:
+            ship_match = re.search(r'SHIP DATE\s*(\d{2}-[A-Z]{3}-\d{2})', line_clean, re.IGNORECASE)
+            if ship_match:
+                date_str = ship_match.group(1)
+                try:
+                    day, month, year = date_str.split('-')
+                    if len(year) == 2:
+                        year = '20' + year
+                    invoice_data['ship_date'] = f"{day}.{month_map.get(month.upper(), '01')}.{year}"
+                except (ValueError, AttributeError):
+                    invoice_data['ship_date'] = date_str
+        
+        # Extract tracking number: "1Z67X3680394280668"
+        tracking_match = re.search(r'(1Z[A-Z0-9]{16})', line_clean)
+        if tracking_match and not invoice_data['tracking_number']:
+            invoice_data['tracking_number'] = tracking_match.group(1)
+    
+    return invoice_data
+
+def _parse_steris_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from STERIS invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'order_no': invoice_data.get('order_no', ''),
+        'sales_order_no': invoice_data.get('sales_order_no', ''),
+        'ship_date': invoice_data.get('ship_date', ''),
+        'tracking_number': invoice_data.get('tracking_number', ''),
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'total_price': '',
+        'page': page_num + 1
+    }
+    
+    # First line: "1 1.1 30808 FLAT CAP VENT BROWN TINT DIA 0.625 X 25 25 0.00 14.84 371.00"
+    first_line = block[0]
+    
+    # Parse using specific pattern for STERIS format
+    # Format: ITEM ORDER ITEM_CODE DESCRIPTION QTY_ORDERED QTY_SHIPPED QTY_BACKORDER UNIT_PRICE TOTAL
+    item_match = re.search(r'^\d+\s+\d+\.\d+\s+(\d+)\s+(.+?)\s+(\d+)\s+(\d+)\s+[\d.]+\s+([\d.]+)\s+([\d.]+)$', first_line)
+    
+    if item_match:
+        item_data['item_code'] = item_match.group(1)  # "30808"
+        item_data['description'] = item_match.group(2).strip()  # "FLAT CAP VENT BROWN TINT DIA 0.625 X"
+        item_data['quantity'] = item_match.group(4)  # Second "25" is quantity shipped
+        item_data['unit_price'] = item_match.group(5)  # "14.84"
+        item_data['total_price'] = item_match.group(6)  # "371.00"
+    
+    # If regex fails, try manual parsing
+    if not item_data['item_code']:
+        parts = first_line.split()
+        if len(parts) >= 10:
+            # Find the 5-digit item code
+            for i, part in enumerate(parts):
+                if re.match(r'^\d{5}$', part) and i >= 2:
+                    item_data['item_code'] = part
+                    
+                    # Find where the numbers start (quantities and prices)
+                    num_indices = []
+                    for j in range(i+1, len(parts)):
+                        if re.match(r'^\d+\.?\d*$', parts[j]):
+                            num_indices.append(j)
+                    
+                    if len(num_indices) >= 5:
+                        # The pattern is: description QTY_ORDERED QTY_SHIPPED QTY_BACKORDER UNIT_PRICE TOTAL
+                        item_data['quantity'] = parts[num_indices[1]]  # Quantity shipped
+                        item_data['unit_price'] = parts[num_indices[3]]  # Unit price
+                        item_data['total_price'] = parts[num_indices[4]]  # Total price
+                    
+                    # Extract description
+                    desc_end = num_indices[0] if num_indices else len(parts)
+                    desc_parts = parts[i+1:desc_end]
+                    item_data['description'] = ' '.join(desc_parts)
+                    break
+    
+    # Add continuation lines to description (like "1IN [100/PK]")
+    if len(block) > 1 and item_data['description']:
+        for i in range(1, len(block)):
+            line = block[i].strip()
+            if line and not re.search(r'SHIPPING|SUBTOTAL|TAX', line, re.IGNORECASE):
+                item_data['description'] += ' - ' + line
+    
+    # Only return if we have essential data
+    if (item_data['item_code'] and item_data['description'] and 
+        item_data['quantity'] and item_data['quantity'] != '0'):
+        return item_data
+    
+    return None
+
+
+#Stork
+def extract_stork_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Stork invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_stork_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            current_order_no = ""
+            current_lst_no = ""
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if re.search(r'Pos\.\s+Article\s+No\.\s+description\s+qty\.\s+each\s+price', line_clean):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Stop at summary sections
+                if re.search(r'total net|Shipping charges|total/EUR|payment', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_lst_no))
+                        current_block = []
+                    break
+                
+                # Look for order number lines
+                order_match = re.search(r'your order no\.\s*([^\s-]+)\s*-\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+                if order_match:
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_lst_no))
+                        current_block = []
+                    current_order_no = order_match.group(1)
+                    continue
+                
+                # Look for LST number lines
+                lst_match = re.search(r'LST\.\s*No\.:\s*(.+)', line_clean, re.IGNORECASE)
+                if lst_match:
+                    current_lst_no = lst_match.group(1).strip()
+                    continue
+                
+                # Look for item lines (they start with numbers like "1 54.468-01")
+                if re.match(r'^\d+\s+\d{2}\.\d{3}-\d{2}', line_clean):  # e.g., "1 54.468-01"
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_lst_no))
+                    current_block = [line_clean]
+                # Continue collecting description lines for the current item
+                elif current_block and line_clean:
+                    current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_lst_no))
+            
+            # Process each item block
+            for block, inv_data, order_no, lst_no in item_blocks:
+                item_data = _parse_stork_item_block(block, inv_data, order_no, lst_no, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_stork_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Stork invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number: "INVOICE NO. : 2230535"
+        inv_match = re.search(r'INVOICE\s*NO\.?\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if inv_match and not invoice_data['invoice_number']:
+            invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Extract invoice date: "Date : 25.09.2023"
+        date_match = re.search(r'Date\s*:\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if date_match and not invoice_data['invoice_date']:
+            invoice_data['invoice_date'] = date_match.group(1)
+        
+        # Extract customer number: "Cust.-No. : 12410"
+        cust_match = re.search(r'Cust\.?-No\.?\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if cust_match and not invoice_data['customer_number']:
+            invoice_data['customer_number'] = cust_match.group(1)
+    
+    return invoice_data
+
+def _parse_stork_item_block(block: List[str], invoice_data: Dict, order_no: str, lst_no: str, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Stork invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'order_no': order_no,
+        'lst_no': lst_no,
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'serial_number': '',
+        'page': page_num + 1
+    }
+    
+    # Parse first line: "1 54.468-01 Day Ear Hook Blunt 16.0cm 10 13,30 133,00"
+    first_line = block[0].strip()
+    
+    # Parse the item line
+    item_match = re.search(r'^\d+\s+(\d{2}\.\d{3}-\d{2})\s+(.+?)\s+(\d+)\s+([\d,]+)\s+([\d,]+)$', first_line)
+    
+    if item_match:
+        item_data['item_code'] = item_match.group(1)  # e.g., "54.468-01"
+        item_data['description'] = item_match.group(2).strip()  # e.g., "Day Ear Hook Blunt 16.0cm"
+        item_data['quantity'] = item_match.group(3)
+        item_data['unit_price'] = item_match.group(4).replace(',', '.')
+        # Removed total_price extraction
+    
+    # Alternative pattern for different formatting
+    if not item_data['item_code']:
+        alt_match = re.search(r'^\d+\s+(\d{2}\.\d{3}-\d{2})\s+(.+?)\s+(\d+)\s+([\d,]+)', first_line)
+        if alt_match:
+            item_data['item_code'] = alt_match.group(1)
+            item_data['description'] = alt_match.group(2).strip()
+            item_data['quantity'] = alt_match.group(3)
+            item_data['unit_price'] = alt_match.group(4).replace(',', '.')
+    
+    # Extract serial number from the block: "S.Nr. 02182119 / Schmelze: 4021-5,0-011"
+    for line in block:
+        serial_match = re.search(r'S\.Nr\.\s*([^/\s]+)(?:\s*/\s*Schmelze:\s*([^/\s]+))?', line, re.IGNORECASE)
+        if serial_match and not item_data['serial_number']:
+            item_data['serial_number'] = serial_match.group(1).strip()
+            if serial_match.group(2):
+                item_data['serial_number'] += ' / ' + serial_match.group(2).strip()
+    
+    # For multi-line descriptions, combine additional lines (like "E7327-62")
+    if len(block) > 1 and item_data['description']:
+        additional_desc = []
+        for i in range(1, len(block)):
+            line = block[i].strip()
+            # Skip lines that contain serial numbers or look like new items
+            if (line and 
+                not re.search(r'S\.Nr\.|Schmelze:', line, re.IGNORECASE) and
+                not re.match(r'^\d+\s+\d{2}\.\d{3}-\d{2}', line) and
+                not re.search(r'total net|Shipping charges', line, re.IGNORECASE)):
+                additional_desc.append(line)
+        
+        if additional_desc:
+            item_data['description'] += ' - ' + ' '.join(additional_desc)
+    
+    # Only return if we have essential data and non-zero quantity
+    if (item_data['item_code'] and item_data['description'] and 
+        item_data['quantity'] and item_data['quantity'] != '0'):
+        return item_data
+    
+    return None
+
+
+#Tontarra
+def extract_tontarra_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Tontarra invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_tontarra_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            current_order_no = ""
+            current_lst = ""
+            current_hs_code = ""
+            current_art_no = ""
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if re.search(r'Pos\.\s+Art\.No\.\s+Description\s+Lot number\s+qty\.\s+each\s+price', line_clean):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Stop at summary sections
+                if re.search(r'total net|packaging|total/EUR|terms of payment', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_lst, current_hs_code, current_art_no))
+                        current_block = []
+                    break
+                
+                # Look for order number lines
+                order_match = re.search(r'your order\s*([^\s-]+)\s*-\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+                if order_match:
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_lst, current_hs_code, current_art_no))
+                        current_block = []
+                    current_order_no = order_match.group(1)
+                    continue
+                
+                # Look for LST number lines
+                lst_match = re.search(r'LST:\s*(.+)', line_clean, re.IGNORECASE)
+                if lst_match:
+                    current_lst = lst_match.group(1).strip()
+                    continue
+                
+                # Look for HS code lines
+                hs_match = re.search(r'HS code:\s*([^\s]+)', line_clean, re.IGNORECASE)
+                if hs_match:
+                    current_hs_code = hs_match.group(1).strip()
+                    continue
+                
+                # Look for article number lines
+                art_match = re.search(r'your art\.no\.:\s*([^\s]+)', line_clean, re.IGNORECASE)
+                if art_match:
+                    current_art_no = art_match.group(1).strip()
+                    continue
+                
+                # Look for item lines (they start with numbers like "10 249-072-05ATCC" or "20 TONO/249-072-04")
+                # ONLY CHANGE: Added forward slash to the pattern
+                if re.match(r'^\d+\s+[A-Z0-9/-]', line_clean):  # e.g., "10 249-072-05ATCC" or "20 TONO/249-072-04"
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_lst, current_hs_code, current_art_no))
+                    current_block = [line_clean]
+                # Continue collecting description lines for the current item
+                elif current_block and line_clean:
+                    current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_lst, current_hs_code, current_art_no))
+            
+            # Process each item block
+            for block, inv_data, order_no, lst_no, hs_code, art_no in item_blocks:
+                item_data = _parse_tontarra_item_block(block, inv_data, order_no, lst_no, hs_code, art_no, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_tontarra_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Tontarra invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'our_ref': '',
+        'dev_no': '',
+        'delivery_note': '',
+        'delivery_date': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number: "INVOICE No. : 24243554"
+        inv_match = re.search(r'INVOICE\s*No\.?\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if inv_match and not invoice_data['invoice_number']:
+            invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Extract invoice date: "DATE : 24.09.2024"
+        date_match = re.search(r'DATE\s*:\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if date_match and not invoice_data['invoice_date']:
+            invoice_data['invoice_date'] = date_match.group(1)
+        
+        # Extract customer number: "Customer : 17096"
+        cust_match = re.search(r'Customer\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if cust_match and not invoice_data['customer_number']:
+            invoice_data['customer_number'] = cust_match.group(1)
+        
+        # Extract our reference: "Our ref. : SUS"
+        ref_match = re.search(r'Our ref\.?\s*:\s*([^\s]+)', line_clean, re.IGNORECASE)
+        if ref_match and not invoice_data['our_ref']:
+            invoice_data['our_ref'] = ref_match.group(1)
+        
+        # Extract DEV number: "DEV: 9680515"
+        dev_match = re.search(r'DEV:\s*(\d+)', line_clean, re.IGNORECASE)
+        if dev_match and not invoice_data['dev_no']:
+            invoice_data['dev_no'] = dev_match.group(1)
+        
+        # Extract delivery note and date: "DELIVERY NOTE No. 23244261 date 23.09.2024"
+        delivery_match = re.search(r'DELIVERY NOTE\s*No\.?\s*(\d+)\s*date\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if delivery_match and not invoice_data['delivery_note']:
+            invoice_data['delivery_note'] = delivery_match.group(1)
+            invoice_data['delivery_date'] = delivery_match.group(2)
+    
+    return invoice_data
+
+def _parse_tontarra_item_block(block: List[str], invoice_data: Dict, order_no: str, lst_no: str, hs_code: str, art_no: str, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Tontarra invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'our_ref': invoice_data.get('our_ref', ''),
+        'dev_no': invoice_data.get('dev_no', ''),
+        'delivery_note': invoice_data.get('delivery_note', ''),
+        'delivery_date': invoice_data.get('delivery_date', ''),
+        'order_no': order_no,
+        'lst_no': lst_no,
+        'hs_code': hs_code,
+        'art_no': art_no,
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot_number': '',
+        'page': page_num + 1
+    }
+    
+    # Parse first line: "10 249-072-05ATCC SWING-SYSTEM ® KERRISON Punch 82402970 3 699,40 1.154,01"
+    # Or: "20 TONO/249-072-04 KERRISON SWING Rongeur; 40° up cut; T01-82102604 2 402,34 804,68"
+    first_line = block[0].strip()
+    
+    # KEEP ORIGINAL REGEX PATTERNS BUT MAKE THEM MORE FLEXIBLE
+    # Original pattern with extended character set for item codes
+    item_match = re.search(r'^\d+\s+([A-Z0-9/-]+)\s+(.+?)\s+([A-Z0-9-]+)\s+(\d+)\s+([\d.,]+)\s+([\d.,]+)$', first_line)
+    
+    if item_match:
+        item_data['item_code'] = item_match.group(1)  # e.g., "249-072-05ATCC" or "TONO/249-072-04"
+        item_data['description'] = item_match.group(2).strip()  # e.g., "SWING-SYSTEM ® KERRISON Punch"
+        item_data['lot_number'] = item_match.group(3)  # e.g., "82402970" or "T01-82102604"
+        item_data['quantity'] = item_match.group(4)
+        item_data['unit_price'] = item_match.group(5).replace('.', '').replace(',', '.')  # Handle "699,40"
+    
+    # Alternative pattern for different formatting - KEEP ORIGINAL BUT EXTEND CHARACTER SET
+    if not item_data['item_code']:
+        alt_match = re.search(r'^\d+\s+([A-Z0-9/-]+)\s+(.+?)\s+([A-Z0-9-]+)\s+(\d+)\s+([\d.,]+)', first_line)
+        if alt_match:
+            item_data['item_code'] = alt_match.group(1)
+            item_data['description'] = alt_match.group(2).strip()
+            item_data['lot_number'] = alt_match.group(3)
+            item_data['quantity'] = alt_match.group(4)
+            item_data['unit_price'] = alt_match.group(5).replace('.', '').replace(',', '.')
+    
+    # FALLBACK: If still no match, use the original manual parsing approach
+    if not item_data['item_code']:
+        parts = first_line.split()
+        if len(parts) >= 7:
+            # The first part is the position number, second part is the item code
+            item_data['item_code'] = parts[1]
+            
+            # Find where the lot number starts (look for alphanumeric codes)
+            lot_number_index = -1
+            for i in range(2, len(parts)):
+                if re.match(r'^[A-Z0-9-]+$', parts[i]) and len(parts[i]) >= 6:
+                    lot_number_index = i
+                    break
+            
+            if lot_number_index != -1:
+                # Description is everything between item code and lot number
+                desc_parts = parts[2:lot_number_index]
+                item_data['description'] = ' '.join(desc_parts)
+                item_data['lot_number'] = parts[lot_number_index]
+                
+                # Quantities and prices come after lot number
+                if len(parts) >= lot_number_index + 4:
+                    item_data['quantity'] = parts[lot_number_index + 1]
+                    item_data['unit_price'] = parts[lot_number_index + 2].replace('.', '').replace(',', '.')
+    
+    # For multi-line descriptions, combine additional lines - KEEP ORIGINAL LOGIC
+    if len(block) > 1 and item_data['description']:
+        additional_desc = []
+        for i in range(1, len(block)):
+            line = block[i].strip()
+            # Skip lines that look like new items or summary sections
+            if (line and 
+                not re.match(r'^\d+\s+[A-Z0-9/-]', line) and
+                not re.search(r'total net|packaging|total/EUR', line, re.IGNORECASE)):
+                additional_desc.append(line)
+        
+        if additional_desc:
+            item_data['description'] += ' - ' + ' '.join(additional_desc)
+    
+    # Only return if we have essential data and non-zero quantity - KEEP ORIGINAL LOGIC
+    if (item_data['item_code'] and item_data['description'] and 
+        item_data['quantity'] and item_data['quantity'] != '0'):
+        return item_data
+    
+    return None
+
+
+#Total Titanium
+def extract_total_titanium_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Total Titanium invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_total_titanium_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section (after the dashed line)
+                if re.search(r'-{20,}Part # / Description-{20,}', line_clean):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Stop at summary sections
+                if re.search(r'Sub-total:|Shipping/Handling Charges:|Invoice Total:', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                        current_block = []
+                    break
+                
+                # Look for item lines (they start with codes like "H-0397 -")
+                if re.match(r'^[A-Z]-\d{4}\s+-', line_clean):  # e.g., "H-0397 -"
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = [line_clean]
+                # Continue collecting description lines for the current item
+                elif current_block and line_clean and not re.match(r'^Job Traveler', line_clean, re.IGNORECASE):
+                    current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy()))
+            
+            # Process each item block
+            for block, inv_data in item_blocks:
+                item_data = _parse_total_titanium_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_total_titanium_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Total Titanium invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'order_no': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number: "Invoice #: 515947"
+        inv_match = re.search(r'Invoice\s*#?:\s*(\d+)', line_clean, re.IGNORECASE)
+        if inv_match and not invoice_data['invoice_number']:
+            invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Extract invoice date: "Invoice Date: 11/27/2024"
+        date_match = re.search(r'Invoice Date:\s*(\d{1,2}/\d{1,2}/\d{4})', line_clean, re.IGNORECASE)
+        if date_match and not invoice_data['invoice_date']:
+            # Convert US date format to European format DD.MM.YYYY
+            us_date = date_match.group(1)
+            parts = us_date.split('/')
+            if len(parts) == 3:
+                invoice_data['invoice_date'] = f"{parts[1]}.{parts[0]}.{parts[2]}"
+        
+        # Extract order number: "PO Number:0017242"
+        po_match = re.search(r'PO Number:\s*(\d+)', line_clean, re.IGNORECASE)
+        if po_match and not invoice_data['order_no']:
+            invoice_data['order_no'] = po_match.group(1)
+    
+    return invoice_data
+
+def _parse_total_titanium_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Total Titanium invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'order_no': invoice_data.get('order_no', ''),
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'page': page_num + 1
+    }
+    
+    # Parse first line: "H-0397 - Paton Spatula and Spoon DBL-Ended 6mm Teardrop- 3 $64.68/ EA $194.04"
+    first_line = block[0].strip()
+    
+    # Parse the item line
+    item_match = re.search(r'^([A-Z]-\d{4})\s+-\s+(.+?)\s+(\d+)\s+\$([\d.]+)/\s*EA\s+\$([\d.]+)$', first_line)
+    
+    if item_match:
+        item_data['item_code'] = item_match.group(1)  # e.g., "H-0397"
+        item_data['description'] = item_match.group(2).strip()  # e.g., "Paton Spatula and Spoon DBL-Ended 6mm Teardrop-"
+        item_data['quantity'] = item_match.group(3)
+        item_data['unit_price'] = item_match.group(4)
+    
+    # Alternative pattern for different formatting
+    if not item_data['item_code']:
+        alt_match = re.search(r'^([A-Z]-\d{4})\s+-\s+(.+?)\s+(\d+)\s+\$([\d.]+)/', first_line)
+        if alt_match:
+            item_data['item_code'] = alt_match.group(1)
+            item_data['description'] = alt_match.group(2).strip()
+            item_data['quantity'] = alt_match.group(3)
+            item_data['unit_price'] = alt_match.group(4)
+    
+    # If still no match, try a more flexible approach
+    if not item_data['item_code']:
+        parts = first_line.split()
+        if len(parts) >= 4:
+            # Look for the item code pattern "H-0397"
+            for i, part in enumerate(parts):
+                if re.match(r'^[A-Z]-\d{4}$', part):
+                    item_data['item_code'] = part
+                    
+                    # Find quantity and price (look for numbers and dollar signs)
+                    for j in range(i+1, len(parts)-2):
+                        if (parts[j+1].startswith('$') and 
+                            re.match(r'^\d+$', parts[j]) and 
+                            '/ EA' in ' '.join(parts[j+1:j+3])):
+                            item_data['quantity'] = parts[j]
+                            # Extract price from "$64.68/ EA"
+                            price_match = re.search(r'\$([\d.]+)', parts[j+1])
+                            if price_match:
+                                item_data['unit_price'] = price_match.group(1)
+                            
+                            # Description is everything between code and quantity
+                            desc_parts = parts[i+1:j]
+                            item_data['description'] = ' '.join(desc_parts)
+                            break
+                    break
+    
+    # For multi-line descriptions, combine additional lines
+    if len(block) > 1 and item_data['description']:
+        additional_desc = []
+        for i in range(1, len(block)):
+            line = block[i].strip()
+            # Skip lines that look like new items or summary sections
+            if (line and 
+                not re.match(r'^[A-Z]-\d{4}\s+-', line) and
+                not re.match(r'^Job Traveler', line, re.IGNORECASE) and
+                not re.search(r'Sub-total:|Shipping/Handling|Invoice Total:', line, re.IGNORECASE)):
+                additional_desc.append(line)
+        
+        if additional_desc:
+            item_data['description'] += ' - ' + ' '.join(additional_desc)
+    
+    # Only return if we have essential data and non-zero quantity
+    if (item_data['item_code'] and item_data['description'] and 
+        item_data['quantity'] and item_data['quantity'] != '0'):
+        return item_data
+    
+    return None
+
+#Ulrich Swiss OCR Needed
+
+#Vinzenz Sattler
+def extract_vinzenz_sattler_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Vinzenz Sattler invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_vinzenz_sattler_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            current_order_no = ""
+            current_listing_no = ""
+            current_your_item_no = ""
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if re.search(r'Order\s+Item\s+Qty\.\s+each\s+Total', line_clean):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Stop at summary sections
+                if re.search(r'Line Value|Package|Gross|Mandatory Notes', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_listing_no, current_your_item_no))
+                        current_block = []
+                    break
+                
+                # Look for order number lines: "0016929 / 10 - 22.08.2024"
+                order_match = re.search(r'(\d{7})(?:\s+corrected)?\s*/\s*\d+\s*-\s*\d{2}\.\d{2}\.\d{4}', line_clean)
+                if order_match:
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_listing_no, current_your_item_no))
+                        current_block = []
+                    current_order_no = order_match.group(1)
+                    continue
+                
+                # Look for listing number lines: "Listing No. B115819/79GAD"
+                listing_match = re.search(r'Listing No\.\s*([^\s]+)', line_clean, re.IGNORECASE)
+                if listing_match:
+                    current_listing_no = listing_match.group(1).strip()
+                    continue
+                
+                # Look for "Your Item No." lines: "Your Item No. C6668-50G"
+                your_item_match = re.search(r'Your Item No\.\s*([^\s]+)', line_clean, re.IGNORECASE)
+                if your_item_match:
+                    current_your_item_no = your_item_match.group(1).strip()
+                    continue
+                
+                # Look for item lines (they start with position numbers like "10 Item No. S 315 3206")
+                if re.match(r'^\d+\s+Item No\.', line_clean):  # e.g., "10 Item No. S 315 3206"
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_listing_no, current_your_item_no))
+                    current_block = [line_clean]
+                # Continue collecting description lines for the current item
+                elif current_block and line_clean:
+                    # Check if this is a new order section
+                    if re.search(r'\d{7}\s*/\s*\d+\s*-\s*\d{2}\.\d{2}\.\d{4}', line_clean):
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_listing_no, current_your_item_no))
+                        current_block = []
+                    else:
+                        current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_listing_no, current_your_item_no))
+            
+            # Process each item block
+            for block, inv_data, order_no, listing_no, your_item_no in item_blocks:
+                item_data = _parse_vinzenz_sattler_item_block(block, inv_data, order_no, listing_no, your_item_no, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_vinzenz_sattler_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Vinzenz Sattler invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'dev_no': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number: "Invoice No. 2240447"
+        inv_match = re.search(r'Invoice No\.?\s*(\d+)', line_clean, re.IGNORECASE)
+        if inv_match and not invoice_data['invoice_number']:
+            invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Extract invoice date: "from 18.09.2024"
+        date_match = re.search(r'from\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if date_match and not invoice_data['invoice_date']:
+            invoice_data['invoice_date'] = date_match.group(1)
+        
+        # Extract customer number: "Customer No. 24004"
+        cust_match = re.search(r'Customer No\.?\s*(\d+)', line_clean, re.IGNORECASE)
+        if cust_match and not invoice_data['customer_number']:
+            invoice_data['customer_number'] = cust_match.group(1)
+        
+        # Extract DEV number: "DEV : 8010376"
+        dev_match = re.search(r'DEV\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if dev_match and not invoice_data['dev_no']:
+            invoice_data['dev_no'] = dev_match.group(1)
+    
+    return invoice_data
+
+def _parse_vinzenz_sattler_item_block(block: List[str], invoice_data: Dict, order_no: str, listing_no: str, your_item_no: str, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Vinzenz Sattler invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'dev_no': invoice_data.get('dev_no', ''),
+        'order_no': order_no,
+        'listing_no': listing_no,
+        'your_item_no': your_item_no,
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot_number': '',
+        'page': page_num + 1
+    }
+    
+    # Parse first line: "10 Item No. S 315 3206 10pcs. 15,26 152,60"
+    first_line = block[0].strip()
+    
+    # Parse the item line - more flexible pattern
+    item_match = re.search(r'^\d+\s+Item No\.\s+([A-Z]\s+\d+\s+\d+(?:\s+[A-Z]+)?)\s+(\d+)pcs\.\s+([\d,]+)\s+[\d,]+$', first_line)
+    
+    if item_match:
+        item_data['item_code'] = item_match.group(1).strip()  # e.g., "S 315 3206"
+        item_data['quantity'] = item_match.group(2)
+        item_data['unit_price'] = item_match.group(3).replace(',', '.')
+    
+    # Alternative pattern for different item code formats
+    if not item_data['item_code']:
+        alt_match = re.search(r'^\d+\s+Item No\.\s+([^\s]+(?:\s+[^\s]+)*)\s+(\d+)pcs\.\s+([\d,]+)', first_line)
+        if alt_match:
+            item_data['item_code'] = alt_match.group(1).strip()
+            item_data['quantity'] = alt_match.group(2)
+            item_data['unit_price'] = alt_match.group(3).replace(',', '.')
+    
+    # Extract lot number from the block: "Lot 10 x F 315 3206/88"
+    for line in block:
+        lot_match = re.search(r'Lot\s+\d+\s*x\s*([^\s/]+(?:\s*[^\s/]+)*)', line, re.IGNORECASE)
+        if lot_match and not item_data['lot_number']:
+            item_data['lot_number'] = lot_match.group(1).strip()
+            break
+    
+    # Extract description from the entire block
+    description_parts = []
+    in_description = False
+    
+    for line in block:
+        line_clean = line.strip()
+        
+        # Look for "Desc." lines
+        if 'Desc.' in line_clean:
+            desc_match = re.search(r'Desc\.\s*(.+)', line_clean, re.IGNORECASE)
+            if desc_match:
+                description_parts.append(desc_match.group(1).strip())
+            in_description = True
+        # Continue description if we're in a description section and line doesn't contain other metadata
+        elif in_description and line_clean and not re.search(r'Lot\s+\d+\s*x|Item No\.|Listing No\.|Your Item No\.', line_clean, re.IGNORECASE):
+            description_parts.append(line_clean)
+        # Stop description if we hit lot number or other metadata
+        elif re.search(r'Lot\s+\d+\s*x', line_clean, re.IGNORECASE):
+            in_description = False
+    
+    # If no explicit "Desc." found, try to extract from continuation lines after item line
+    if not description_parts and len(block) > 1:
+        for i in range(1, len(block)):
+            line = block[i].strip()
+            # Skip lines that contain metadata
+            if (line and 
+                not re.search(r'Lot\s+\d+\s*x|Listing No\.|Your Item No\.', line, re.IGNORECASE) and
+                not re.match(r'^\d+\s+Item No\.', line)):
+                description_parts.append(line)
+    
+    if description_parts:
+        item_data['description'] = ' - '.join(description_parts)
+    
+    # Only return if we have essential data and non-zero quantity
+    if (item_data['item_code'] and item_data['description'] and 
+        item_data['quantity'] and item_data['quantity'] != '0'):
+        return item_data
+    
+    return None
+
+
+#Vollrath
+def extract_vollrath_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Vollrath invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_vollrath_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if re.search(r'Ordered\s+Shipped\s+U/M\s+Catalog No\.\s+Item Description', line_clean):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Stop at summary sections
+                if re.search(r'The following picking lists|Terms|Conditions|Seller warrants', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                        current_block = []
+                    break
+                
+                # Look for item lines (they start with numbers)
+                if re.match(r'^\d+\s+\d+\s+[A-Z]{2}\s+', line_clean):  # e.g., "11 11 EA 30042M"
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy()))
+                    current_block = [line_clean]
+                # Continue collecting description lines for the current item
+                elif current_block and line_clean and not re.match(r'^\d+\s+\d+\s+[A-Z]{2}\s+', line_clean):
+                    current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy()))
+            
+            # Process each item block
+            for block, inv_data in item_blocks:
+                item_data = _parse_vollrath_item_block(block, inv_data, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_vollrath_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Vollrath invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'order_no': '',
+        'order_date': ''
+    }
+    
+    # Look for the header line first
+    header_found = False
+    for i, line in enumerate(lines):
+        line_clean = line.strip()
+        
+        # Find the header line
+        if re.search(r'Customer Order Number.*Invoice No\.', line_clean):
+            header_found = True
+            continue
+        
+        # The next line after the header contains the data
+        if header_found and re.match(r'^\d{7}\s+', line_clean):
+            # This is the data line: "0016052 01/17/24 Sales Order 4468802 RI 01/19/24"
+            parts = line_clean.split()
+            
+            # Extract fields based on expected positions
+            if len(parts) >= 6:
+                # Order number: "0016052" (first field)
+                invoice_data['order_no'] = parts[0]
+                
+                # Order date: "01/17/24" -> "17.01.2024" (second field)
+                if len(parts) > 1:
+                    order_date = parts[1]
+                    order_parts = order_date.split('/')
+                    if len(order_parts) == 3:
+                        year = '20' + order_parts[2] if len(order_parts[2]) == 2 else order_parts[2]
+                        invoice_data['order_date'] = f"{order_parts[1]}.{order_parts[0]}.{year}"
+                
+                # Find invoice number - look for 7-digit number after "Sales Order"
+                for j, part in enumerate(parts):
+                    if part == 'Sales' and j + 2 < len(parts):
+                        if re.match(r'^\d{7}$', parts[j + 2]):
+                            invoice_data['invoice_number'] = parts[j + 2]
+                            break
+                
+                # If not found with "Sales Order", look for any 7-digit number
+                if not invoice_data['invoice_number']:
+                    for part in parts:
+                        if re.match(r'^\d{7}$', part) and part != invoice_data['order_no']:
+                            invoice_data['invoice_number'] = part
+                            break
+                
+                # Find invoice date - look for date pattern at the end
+                for part in reversed(parts):
+                    if re.match(r'^\d{2}/\d{2}/\d{2}$', part):
+                        invoice_parts = part.split('/')
+                        if len(invoice_parts) == 3:
+                            year = '20' + invoice_parts[2] if len(invoice_parts[2]) == 2 else invoice_parts[2]
+                            invoice_data['invoice_date'] = f"{invoice_parts[1]}.{invoice_parts[0]}.{year}"
+                        break
+            
+            # Reset header flag after processing
+            header_found = False
+    
+    # Alternative approach if the above fails - look for specific patterns
+    if not invoice_data['invoice_number'] or not invoice_data['invoice_date']:
+        for line in lines:
+            line_clean = line.strip()
+            
+            # Look for invoice number pattern
+            if not invoice_data['invoice_number']:
+                inv_match = re.search(r'(\d{7})(?:\s+[A-Z]+\s+\d{2}/\d{2}/\d{2})?$', line_clean)
+                if inv_match and inv_match.group(1) != invoice_data['order_no']:
+                    invoice_data['invoice_number'] = inv_match.group(1)
+            
+            # Look for invoice date pattern at the end of lines
+            if not invoice_data['invoice_date']:
+                date_match = re.search(r'(\d{2}/\d{2}/\d{2})$', line_clean)
+                if date_match:
+                    date_parts = date_match.group(1).split('/')
+                    if len(date_parts) == 3:
+                        year = '20' + date_parts[2] if len(date_parts[2]) == 2 else date_parts[2]
+                        invoice_data['invoice_date'] = f"{date_parts[1]}.{date_parts[0]}.{year}"
+    
+    return invoice_data
+
+def _parse_vollrath_item_block(block: List[str], invoice_data: Dict, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from Vollrath invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'order_no': invoice_data.get('order_no', ''),
+        'order_date': invoice_data.get('order_date', ''),
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'page': page_num + 1
+    }
+    
+    # Parse first line: "11 11 EA 30042M STERILIZATION TRAY/BATH SET 4" PAN 22 GA 45.9000 EA 504.90"
+    first_line = block[0].strip()
+    
+    # Use regex to parse the specific structure
+    # Format: QTY QTY EA ITEM_CODE DESCRIPTION UNIT_PRICE EA TOTAL
+    item_match = re.search(r'^(\d+)\s+\d+\s+EA\s+([A-Z0-9]+)\s+(.+?)\s+([\d.]+)\s+EA\s+[\d.]+$', first_line)
+    
+    if item_match:
+        item_data['quantity'] = item_match.group(1)  # First number is quantity
+        item_data['item_code'] = item_match.group(2)  # e.g., "30042M"
+        item_data['description'] = item_match.group(3).strip()  # e.g., "STERILIZATION TRAY/BATH SET 4" PAN 22 GA"
+        item_data['unit_price'] = item_match.group(4)  # e.g., "45.9000"
+    
+    # Alternative pattern if the first one fails
+    if not item_data['item_code']:
+        # Try splitting and manual parsing
+        parts = first_line.split()
+        if len(parts) >= 7:
+            # First part is quantity: "11"
+            item_data['quantity'] = parts[0]
+            
+            # Find "EA" positions to locate fields
+            ea_positions = [i for i, part in enumerate(parts) if part == 'EA']
+            
+            if len(ea_positions) >= 2:
+                # Item code is after first "EA"
+                if ea_positions[0] + 1 < len(parts):
+                    item_data['item_code'] = parts[ea_positions[0] + 1]
+                
+                # Unit price is before second "EA"
+                if ea_positions[1] - 1 >= 0:
+                    item_data['unit_price'] = parts[ea_positions[1] - 1]
+                
+                # Description is between item code and unit price
+                desc_start = ea_positions[0] + 2
+                desc_end = ea_positions[1] - 1
+                if desc_end > desc_start:
+                    item_data['description'] = ' '.join(parts[desc_start:desc_end])
+    
+    # For multi-line descriptions, combine additional lines (like "9393-09")
+    if len(block) > 1 and item_data['description']:
+        additional_desc = []
+        for i in range(1, len(block)):
+            line = block[i].strip()
+            # Skip lines that look like new items or summary sections
+            if (line and 
+                not re.match(r'^\d+\s+\d+\s+[A-Z]{2}\s+', line) and
+                not re.search(r'The following picking lists|Terms|Conditions', line, re.IGNORECASE)):
+                additional_desc.append(line)
+        
+        if additional_desc:
+            item_data['description'] += ' - ' + ' '.join(additional_desc)
+    
+    # Only return if we have essential data and non-zero quantity
+    # Skip broken case charges and other non-product items
+    if (item_data['item_code'] and item_data['description'] and 
+        item_data['quantity'] and item_data['quantity'] != '0' and
+        not re.search(r'Broken Case Charge', item_data['description'], re.IGNORECASE)):
+        return item_data
+    
+    return None
+
+
+#WEBA
+def extract_weba_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from WEBA invoice format.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            lines = text.split("\n")
+            
+            # Extract invoice-level info
+            invoice_data = _extract_weba_invoice_info(lines)
+            
+            # Find item blocks
+            item_blocks = []
+            current_block = []
+            in_items_section = False
+            current_order_no = ""
+            current_lst = ""
+            current_art_no = ""
+            
+            for i, line in enumerate(lines):
+                line_clean = line.strip()
+                
+                # Look for the start of the items section
+                if re.search(r'POS\s+ARTICLE/\s+description\s+qty\.\s+each\s+price', line_clean):
+                    in_items_section = True
+                    continue
+                
+                if not in_items_section:
+                    continue
+                
+                # Stop at summary sections
+                if re.search(r'total net|package:|total/EUR|carry-over|T O T A L:', line_clean, re.IGNORECASE):
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_lst, current_art_no))
+                        current_block = []
+                    break
+                
+                # Look for order number lines
+                order_match = re.search(r'your order no\.\s*([^\s-]+)\s*-\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+                if order_match:
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_lst, current_art_no))
+                        current_block = []
+                    current_order_no = order_match.group(1)
+                    continue
+                
+                # Look for LST number lines
+                lst_match = re.search(r'LST:\s*([^\s-]+(?:\s*-\s*[^\s]+)?)', line_clean, re.IGNORECASE)
+                if lst_match:
+                    current_lst = lst_match.group(1).strip()
+                    continue
+                
+                # Look for article number lines
+                art_match = re.search(r'your art\.-?no\.:\s*([^\s]+)', line_clean, re.IGNORECASE)
+                if art_match:
+                    current_art_no = art_match.group(1).strip()
+                    continue
+                
+                # Look for item lines (they start with numbers like "10 WB 70-013")
+                if re.match(r'^\d+\s+WB\s+', line_clean):  # e.g., "10 WB 70-013"
+                    if current_block:
+                        item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_lst, current_art_no))
+                    current_block = [line_clean]
+                # Continue collecting description lines for the current item
+                elif current_block and line_clean:
+                    current_block.append(line_clean)
+            
+            if current_block:
+                item_blocks.append((current_block, invoice_data.copy(), current_order_no, current_lst, current_art_no))
+            
+            # Process each item block
+            for block, inv_data, order_no, lst_no, art_no in item_blocks:
+                item_data = _parse_weba_item_block(block, inv_data, order_no, lst_no, art_no, page_num)
+                if item_data:
+                    extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_weba_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from WEBA invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer_number': '',
+        'dev_no': '',
+        'our_sign': '',
+        'cred_no': ''
+    }
+    
+    for line in lines:
+        line_clean = line.strip()
+        
+        # Extract invoice number: "INVOICE NO. : 510916"
+        inv_match = re.search(r'INVOICE\s*NO\.?\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if inv_match and not invoice_data['invoice_number']:
+            invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Extract invoice date: "Date : 27.06.2023"
+        date_match = re.search(r'Date\s*:\s*(\d{2}\.\d{2}\.\d{4})', line_clean, re.IGNORECASE)
+        if date_match and not invoice_data['invoice_date']:
+            invoice_data['invoice_date'] = date_match.group(1)
+        
+        # Extract customer number: "Cust.-No. : 56644"
+        cust_match = re.search(r'Cust\.?-No\.?\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if cust_match and not invoice_data['customer_number']:
+            invoice_data['customer_number'] = cust_match.group(1)
+        
+        # Extract DEV number: "DEV : 8010282"
+        dev_match = re.search(r'DEV\s*:\s*(\d+)', line_clean, re.IGNORECASE)
+        if dev_match and not invoice_data['dev_no']:
+            invoice_data['dev_no'] = dev_match.group(1)
+        
+        # Extract our sign: "Our sign : TSC"
+        sign_match = re.search(r'Our sign\s*:\s*([^\s]+)', line_clean, re.IGNORECASE)
+        if sign_match and not invoice_data['our_sign']:
+            invoice_data['our_sign'] = sign_match.group(1)
+        
+        # Extract credit number: "Cred.No. : 02-2500101"
+        cred_match = re.search(r'Cred\.?No\.?\s*:\s*([^\s]+)', line_clean, re.IGNORECASE)
+        if cred_match and not invoice_data['cred_no']:
+            invoice_data['cred_no'] = cred_match.group(1)
+    
+    return invoice_data
+
+def _parse_weba_item_block(block: List[str], invoice_data: Dict, order_no: str, lst_no: str, art_no: str, page_num: int) -> Optional[Dict]:
+    """Parse an individual item block from WEBA invoice"""
+    if not block:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer_number': invoice_data['customer_number'],
+        'dev_no': invoice_data.get('dev_no', ''),
+        'our_sign': invoice_data.get('our_sign', ''),
+        'cred_no': invoice_data.get('cred_no', ''),
+        'order_no': order_no,
+        'lst_no': lst_no,
+        'art_no': art_no,
+        'item_code': '',
+        'description': '',
+        'quantity': '',
+        'unit_price': '',
+        'lot_number': '',
+        'page': page_num + 1
+    }
+    
+    # Parse first line: "10 WB 70-013 Citelly Rongeur 2,0 mm bite 1 185,60 185,60"
+    first_line = block[0].strip()
+    
+    # Parse the item line
+    item_match = re.search(r'^\d+\s+WB\s+([^\s]+)\s+(.+?)\s+(\d+)\s+([\d,]+)\s+[\d,]+$', first_line)
+    
+    if item_match:
+        item_data['item_code'] = "WB " + item_match.group(1)  # e.g., "WB 70-013"
+        item_data['description'] = item_match.group(2).strip()  # e.g., "Citelly Rongeur 2,0 mm bite"
+        item_data['quantity'] = item_match.group(3)
+        item_data['unit_price'] = item_match.group(4).replace(',', '.')
+    
+    # Alternative pattern for different formatting
+    if not item_data['item_code']:
+        alt_match = re.search(r'^\d+\s+WB\s+([^\s]+)\s+(.+?)\s+(\d+)\s+([\d,]+)', first_line)
+        if alt_match:
+            item_data['item_code'] = "WB " + alt_match.group(1)
+            item_data['description'] = alt_match.group(2).strip()
+            item_data['quantity'] = alt_match.group(3)
+            item_data['unit_price'] = alt_match.group(4).replace(',', '.')
+    
+    # Extract lot number from the block: "Lot number 07/2016-023 / WE"
+    for line in block:
+        lot_match = re.search(r'Lot number\s*([^/\n]+(?:\s*/\s*[^/\n]+)*)', line, re.IGNORECASE)
+        if lot_match and not item_data['lot_number']:
+            item_data['lot_number'] = lot_match.group(1).strip()
+            break
+    
+    # For multi-line descriptions, combine additional lines
+    if len(block) > 1 and item_data['description']:
+        additional_desc = []
+        for i in range(1, len(block)):
+            line = block[i].strip()
+            # Skip lines that contain lot numbers or look like new items
+            if (line and 
+                not re.search(r'Lot number', line, re.IGNORECASE) and
+                not re.match(r'^\d+\s+WB\s+', line) and
+                not re.search(r'total net|package:|carry-over', line, re.IGNORECASE)):
+                additional_desc.append(line)
+        
+        if additional_desc:
+            item_data['description'] += ' - ' + ' '.join(additional_desc)
+    
+    # Only return if we have essential data and non-zero quantity
+    if (item_data['item_code'] and item_data['description'] and 
+        item_data['quantity'] and item_data['quantity'] != '0'):
+        return item_data
+    
+    return None
+
+
+#Y&W
+def extract_yw_invoice_data(pdf_content: bytes) -> List[Dict]:
+    """
+    Extract data from Y&W invoice format.
+    Handles both layout variations automatically.
+    Returns a list of dictionaries containing the extracted data for each line item.
+    """
+    extracted_data = []
+    with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        full_text = ""
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                full_text += text + "\n"
+        
+        # Determine invoice format based on content
+        if "ITEM# QTY LOT# DESCRIPTION" in full_text:
+            return _extract_yw_format_v2(full_text)
+        else:
+            return _extract_yw_format_v1(full_text)
+
+def _extract_yw_format_v1(full_text: str) -> List[Dict]:
+    """Extract data from Y&W Format V1 (like Invoice #95597)"""
+    extracted_data = []
+    lines = full_text.split("\n")
+    
+    # Extract invoice-level info
+    invoice_data = _extract_yw_invoice_info(lines)
+    
+    # Find all item sections across all pages
+    item_sections = _extract_item_sections_v1(lines)
+    
+    # Track processed items to avoid duplicates
+    processed_items = set()
+    
+    # Process each item section
+    for item_lines in item_sections:
+        item_data = _parse_yw_item_lines_v1(item_lines, invoice_data)
+        if item_data:
+            # Create a unique key for this item to avoid duplicates
+            item_key = f"{item_data['item_number']}_{item_data['item_code']}_{item_data['order_no']}_{item_data['packing_list']}"
+            
+            if item_key not in processed_items:
+                processed_items.add(item_key)
+                extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_item_sections_v1(lines: List[str]) -> List[List[str]]:
+    """Extract item sections from V1 format"""
+    item_sections = []
+    current_section = []
+    in_items_section = False
+    found_items = False
+    
+    for i, line in enumerate(lines):
+        line_clean = line.strip()
+        
+        # Look for the start of the items section
+        if re.search(r'Item\s+Quantity\s+Description\s+Revision\s+Unit Price\s+Amount', line_clean):
+            in_items_section = True
+            found_items = True
+            continue
+        
+        if not in_items_section:
+            continue
+        
+        # Stop at summary sections (but only after we've found items)
+        if found_items and re.search(r'Sub-total:|Sales Tax:|Shipping Charges:|Invoice Total:', line_clean, re.IGNORECASE):
+            if current_section:
+                item_sections.append(current_section)
+                current_section = []
+            in_items_section = False
+            continue
+        
+        # Look for item lines (they start with numbers like "1 2 E7210-44E")
+        if re.match(r'^\d+\s+\d+\s+[A-Z]', line_clean):  # e.g., "1 2 E7210-44E"
+            if current_section:
+                item_sections.append(current_section)
+            current_section = [line_clean]
+        elif current_section and line_clean:
+            # Continue collecting lines for the current item
+            # Skip page headers/footers
+            if not _is_page_header_footer(line_clean):
+                current_section.append(line_clean)
+    
+    if current_section:
+        item_sections.append(current_section)
+    
+    return item_sections
+
+def _is_page_header_footer(line: str) -> bool:
+    """Check if a line is a page header or footer"""
+    line_clean = line.strip()
+    # Page headers/footers typically contain dates, page numbers, or report generated info
+    if (re.search(r'Report Generated:', line_clean, re.IGNORECASE) or
+        re.search(r'Page \d+ of \d+', line_clean, re.IGNORECASE) or
+        re.search(r'\d{1,2}:\d{2}:\d{2}[AP]M', line_clean, re.IGNORECASE)):
+        return True
+    return False
+
+def _parse_yw_item_lines_v1(item_lines: List[str], invoice_data: Dict) -> Optional[Dict]:
+    """Parse item lines from V1 format"""
+    if not item_lines:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer': invoice_data['customer'],
+        'po_number': invoice_data['po_number'],
+        'lot_no': invoice_data['lot_no'],
+        'order_no': '',
+        'packing_list': '',
+        'item_number': '',
+        'quantity': '',
+        'item_code': '',
+        'description': '',
+        'unit_price': '',
+    }
+    
+    # Parse first line (main item line)
+    first_line = item_lines[0].strip()
+    
+    # Improved regex pattern for V1 format
+    # Pattern for: "1 2 E7210-44E - FARRIOR EAR SPEC, OVAL ANGLED $200.00/ LOT $200.00"
+    item_match = re.search(r'^(\d+)\s+(\d+)\s+([A-Z][A-Z0-9-]+)\s*-?\s*(.+?)\s*\$?([\d,]+\.\d{2})/?\s*[A-Z]+\s*\$?[\d,]+\.\d{2}', first_line)
+    
+    if not item_match:
+        # Alternative pattern for different formatting
+        item_match = re.search(r'^(\d+)\s+(\d+)\s+([A-Z][A-Z0-9-]+)\s*(.+?)\s*\$?([\d,]+\.\d{2})', first_line)
+    
+    if item_match:
+        item_data['item_number'] = item_match.group(1)
+        item_data['quantity'] = item_match.group(2)
+        item_data['item_code'] = item_match.group(3)
+        item_data['description'] = item_match.group(4).strip()
+        item_data['unit_price'] = item_match.group(5).replace(',', '')
+    
+    # Process additional lines for description continuation and order/packing info
+    for line in item_lines[1:]:
+        line_clean = line.strip()
+        
+        # Skip page headers/footers
+        if _is_page_header_footer(line_clean):
+            continue
+            
+        # Look for order number
+        order_match = re.search(r'Order No:\s*(\d+)', line_clean, re.IGNORECASE)
+        if order_match and not item_data['order_no']:
+            item_data['order_no'] = order_match.group(1)
+            continue
+        
+        # Look for packing list
+        packing_match = re.search(r'Packing List:\s*(\d+)', line_clean, re.IGNORECASE)
+        if packing_match and not item_data['packing_list']:
+            item_data['packing_list'] = packing_match.group(1)
+            continue
+        
+        # If line doesn't contain order/packing info and is not empty, add to description
+        if (line_clean and 
+            not re.search(r'Order No:|Packing List:', line_clean, re.IGNORECASE) and
+            not re.match(r'^\d+\s+\d+\s+[A-Z]', line_clean) and
+            not _is_page_header_footer(line_clean)):
+            item_data['description'] += ' ' + line_clean
+    
+    # Clean up description - remove price patterns if they ended up in description
+    item_data['description'] = re.sub(r'\$?[\d,]+\.\d{2}/?\s*[A-Z]*\s*\$?[\d,]*\.?\d*', '', item_data['description']).strip()
+    item_data['description'] = re.sub(r'\s+', ' ', item_data['description']).strip()
+    
+    return item_data if item_data['item_code'] and item_data['quantity'] else None
+
+def _extract_yw_format_v2(full_text: str) -> List[Dict]:
+    """Extract data from Y&W Format V2 (like Invoice #96833)"""
+    extracted_data = []
+    lines = full_text.split("\n")
+    
+    # Extract invoice-level info
+    invoice_data = _extract_yw_invoice_info(lines)
+    
+    # Find all item sections
+    item_sections = _extract_item_sections_v2(lines)
+    
+    # Track processed items to avoid duplicates
+    processed_items = set()
+    
+    # Process each item section
+    for item_lines in item_sections:
+        item_data = _parse_yw_item_lines_v2(item_lines, invoice_data)
+        if item_data:
+            # Create a unique key for this item to avoid duplicates
+            item_key = f"{item_data['item_number']}_{item_data['item_code']}_{item_data['order_no']}_{item_data['packing_list']}"
+            
+            if item_key not in processed_items:
+                processed_items.add(item_key)
+                extracted_data.append(item_data)
+    
+    return extracted_data
+
+def _extract_item_sections_v2(lines: List[str]) -> List[List[str]]:
+    """Extract item sections from V2 format"""
+    item_sections = []
+    current_section = []
+    in_items_section = False
+    found_items = False
+    
+    for i, line in enumerate(lines):
+        line_clean = line.strip()
+        
+        # Look for the start of the items section in V2 format
+        if re.search(r'Item\s+Quantity\s+Description\s+Revision\s+Unit Price\s+Amount', line_clean):
+            in_items_section = True
+            found_items = True
+            continue
+        
+        if not in_items_section:
+            # Also check for the ITEM# QTY LOT# DESCRIPTION format
+            if re.search(r'ITEM#\s+QTY\s+LOT#\s+DESCRIPTION', line_clean):
+                in_items_section = True
+                found_items = True
+            continue
+        
+        # Stop at summary sections (but only after we've found items)
+        if found_items and re.search(r'Sub-total:|Sales Tax:|Shipping Charges:|Invoice Total:', line_clean, re.IGNORECASE):
+            if current_section:
+                item_sections.append(current_section)
+                current_section = []
+            in_items_section = False
+            continue
+        
+        # Look for item lines in V2 format
+        if re.match(r'^\d+\s+\d+\s+NOVO SURGICAL INSTRUMENTS', line_clean):
+            if current_section:
+                item_sections.append(current_section)
+            current_section = [line_clean]
+        elif current_section and line_clean:
+            # Continue collecting lines for the current item
+            # Skip page headers/footers
+            if not _is_page_header_footer(line_clean):
+                current_section.append(line_clean)
+    
+    if current_section:
+        item_sections.append(current_section)
+    
+    return item_sections
+
+def _parse_yw_item_lines_v2(item_lines: List[str], invoice_data: Dict) -> Optional[Dict]:
+    """Parse item lines from V2 format"""
+    if not item_lines:
+        return None
+    
+    item_data = {
+        'invoice_date': invoice_data['invoice_date'],
+        'invoice_number': invoice_data['invoice_number'],
+        'customer': invoice_data['customer'],
+        'po_number': invoice_data['po_number'],
+        'lot_no': invoice_data['lot_no'],
+        'order_no': '',
+        'packing_list': '',
+        'item_number': '',
+        'quantity': '',
+        'item_code': 'NOVO SURGICAL INSTRUMENTS',
+        'description': '',
+        'unit_price': '',
+    }
+    
+    # Parse first line
+    first_line = item_lines[0].strip()
+    
+    # Pattern for: "1 6 NOVO SURGICAL INSTRUMENTS - Ebonize $200.00/ LOT $200.00"
+    item_match = re.search(r'^(\d+)\s+(\d+)\s+NOVO SURGICAL INSTRUMENTS\s*-?\s*(.+?)\s*\$?([\d,]+\.\d{2})/?\s*[A-Z]+\s*\$?[\d,]+\.\d{2}', first_line)
+    
+    if item_match:
+        item_data['item_number'] = item_match.group(1)
+        item_data['quantity'] = item_match.group(2)
+        item_data['description'] = f"NOVO SURGICAL INSTRUMENTS - {item_match.group(3).strip()}"
+        item_data['unit_price'] = item_match.group(4).replace(',', '')
+    
+    # Process additional lines for order/packing info
+    for line in item_lines[1:]:
+        line_clean = line.strip()
+        
+        # Skip page headers/footers
+        if _is_page_header_footer(line_clean):
+            continue
+            
+        # Look for order number
+        order_match = re.search(r'Order No:\s*(\d+)', line_clean, re.IGNORECASE)
+        if order_match and not item_data['order_no']:
+            item_data['order_no'] = order_match.group(1)
+            continue
+        
+        # Look for packing list
+        packing_match = re.search(r'Packing List:\s*(\d+)', line_clean, re.IGNORECASE)
+        if packing_match and not item_data['packing_list']:
+            item_data['packing_list'] = packing_match.group(1)
+            continue
+    
+    return item_data if item_data['quantity'] else None
+
+def _extract_yw_invoice_info(lines: List[str]) -> Dict[str, str]:
+    """Extract invoice information from Y&W invoice"""
+    invoice_data = {
+        'invoice_number': '',
+        'invoice_date': '',
+        'customer': '',
+        'po_number': '',
+        'lot_no': '',
+        'ship_to_address': '',
+        'sold_to_address': '',
+        'terms': '',
+        'salesman': ''
+    }
+    
+    ship_to_lines = []
+    sold_to_lines = []
+    in_ship_to = False
+    in_sold_to = False
+    
+    for i, line in enumerate(lines):
+        line_clean = line.strip()
+        
+        # Skip page headers/footers
+        if _is_page_header_footer(line_clean):
+            continue
+            
+        # Extract invoice number
+        inv_match = re.search(r'Invoice Number:\s*(\d+)', line_clean, re.IGNORECASE)
+        if inv_match and not invoice_data['invoice_number']:
+            invoice_data['invoice_number'] = inv_match.group(1)
+        
+        # Extract invoice date
+        date_match = re.search(r'Invoice Date:\s*(\d{2}/\d{2}/\d{4})', line_clean, re.IGNORECASE)
+        if date_match and not invoice_data['invoice_date']:
+            invoice_data['invoice_date'] = date_match.group(1)
+        
+        # Extract customer
+        cust_match = re.search(r'Customer:\s*([^\n]+)', line_clean, re.IGNORECASE)
+        if cust_match and not invoice_data['customer']:
+            invoice_data['customer'] = cust_match.group(1).strip()
+        
+        # Extract PO number
+        po_match = re.search(r'PO Number:\s*([^\n]+)', line_clean, re.IGNORECASE)
+        if po_match and not invoice_data['po_number']:
+            invoice_data['po_number'] = po_match.group(1).strip()
+        
+        # Extract JOB/LOT numbers - renamed to lot_no
+        job_match = re.search(r'JOB/LOT#\s*([^\n]+)', line_clean, re.IGNORECASE)
+        if job_match and not invoice_data['lot_no']:
+            invoice_data['lot_no'] = job_match.group(1).strip()
+        
+        # Extract terms
+        terms_match = re.search(r'Terms:\s*([^\n]+)', line_clean, re.IGNORECASE)
+        if terms_match and not invoice_data['terms']:
+            invoice_data['terms'] = terms_match.group(1).strip()
+        
+        # Extract salesman
+        salesman_match = re.search(r'Salesman:\s*([^\n]+)', line_clean, re.IGNORECASE)
+        if salesman_match and not invoice_data['salesman']:
+            invoice_data['salesman'] = salesman_match.group(1).strip()
+        
+        # Extract ship to address
+        if 'Ship' in line_clean and 'To:' in line_clean:
+            in_ship_to = True
+            in_sold_to = False
+            continue
+        elif 'Sold' in line_clean and 'To:' in line_clean:
+            in_sold_to = True
+            in_ship_to = False
+            continue
+        elif 'Invoice Number:' in line_clean:
+            in_ship_to = False
+            in_sold_to = False
+        
+        if in_ship_to and line_clean and not any(x in line_clean for x in ['Ship', 'To:']):
+            ship_to_lines.append(line_clean)
+        elif in_sold_to and line_clean and not any(x in line_clean for x in ['Sold', 'To:']):
+            sold_to_lines.append(line_clean)
+    
+    # Combine address lines
+    if ship_to_lines:
+        invoice_data['ship_to_address'] = ' '.join(ship_to_lines).strip()
+    if sold_to_lines:
+        invoice_data['sold_to_address'] = ' '.join(sold_to_lines).strip()
+    
+    return invoice_data
 
 
 def process_pdfs(pdf_files, vendor):
@@ -7614,9 +13734,68 @@ def process_pdfs(pdf_files, vendor):
             data = extract_ilg_invoice_data(pdf_content)
         elif vendor == 'Josef Betzler':
             data = extract_josef_betzler_invoice_data(pdf_content)
+        elif vendor == 'KAPP':
+            data = extract_kapp_invoice_data(pdf_content)
+        elif vendor == 'Kohler':
+            data = extract_kohler_invoice_data(pdf_content)
+        elif vendor == 'Medin':
+            data = extract_medin_invoice_data(pdf_content)
+        elif vendor == 'Microqore':
+            data = extract_microqore_invoice_data(pdf_content)
+        elif vendor == 'Otto Ruttgers':
+            data = extract_otto_ruttgers_invoice_data(pdf_content)
+        elif vendor == 'Phoenix Instruments':
+            data = extract_phoenix_invoice_data(pdf_content)
+        elif vendor == 'Precision Medical':
+            data = extract_precision_medical_invoice_data(pdf_content)
+        elif vendor == 'Rebstock':
+            data = extract_rebstock_invoice_data(pdf_content)
+        elif vendor == 'Rica':
+            data = extract_rica_invoice_data(pdf_content)
+        elif vendor == 'Rudischhauser':
+            data = extract_rudischhauser_invoice_data(pdf_content)
+        elif vendor == 'Rudolf Storz':
+            data = extract_rudolfstorz_invoice_data(pdf_content)
+        elif vendor == 'Ruhof':
+            data = extract_ruhof_invoice_data(pdf_content)
+        elif vendor == 'S.u.A. Martin':
+            data = extract_sua_invoice_data(pdf_content)
+        elif vendor == 'Schmid':
+            data = extract_schmid_invoice_data(pdf_content)
+        elif vendor == 'SGS North America':
+            data = extract_sgs_invoice_data(pdf_content)
+        elif vendor == 'SIBEL':
+            data = extract_sibel_invoice_data(pdf_content)
+        elif vendor == 'Siema':
+            data = extract_siema_invoice_data(pdf_content)
+        elif vendor == 'SignTech':
+            data = extract_sigtech_invoice_data(pdf_content)
+        elif vendor == 'SIS':
+            data = extract_sis_invoice_data(pdf_content)
+        elif vendor == 'Sitec':
+            data = extract_sitec_invoice_data(pdf_content)
+        elif vendor == 'SMT':
+            data = extract_smt_invoice_data(pdf_content)
+        elif vendor == 'Stengelin':
+            data = extract_stengelin_invoice_data(pdf_content)
+        elif vendor == 'Steris':
+            data = extract_steris_invoice_data(pdf_content)
+        elif vendor == 'Stork':
+            data = extract_stork_invoice_data(pdf_content)
+        elif vendor == 'Tontarra':
+            data = extract_tontarra_invoice_data(pdf_content)
+        elif vendor == 'Total Titanium':
+            data = extract_total_titanium_invoice_data(pdf_content)
+        elif vendor == 'Vinzenz Sattler':
+            data = extract_vinzenz_sattler_invoice_data(pdf_content)
+        elif vendor == 'Vollrath':
+            data = extract_vollrath_invoice_data(pdf_content)
+        elif vendor == 'WEBA':
+            data = extract_weba_invoice_data(pdf_content)
+        elif vendor == 'Y&W':
+            data = extract_yw_invoice_data(pdf_content)
         else:
             continue
-
         all_data.extend(data)
 
         # Update progress bar
@@ -7670,6 +13849,37 @@ vendor_options = [
     "Holger",
     "ILG",
     "Josef Betzler",
+    "KAPP",
+    "Kohler",
+    "Medin",
+    "Microqore",
+    "Otto Ruttgers",
+    "Phoenix Instruments",
+    "Precision Medical",
+    "Rebstock",
+    "Rica",
+    "Rudischhauser",
+    "Rudolf Storz",
+    "Ruhof",
+    "S.u.A. Martin",
+    "Schmid",
+    "SGS North America",
+    "SIBEL",
+    "Siema",
+    "SignTech",
+    "SIS",
+    "Sitec",
+    "SMT",
+    "Stengelin",
+    "Steris",
+    "Stork",
+    "Tontarra",
+    "Total Titanium",
+    "Vinzenz Sattler",
+    "Vollrath",
+    "WEBA",
+    "Y&W"
+
 
 
 ]
