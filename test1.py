@@ -144,7 +144,7 @@ def get_binary_file_downloader_html(bin_file, file_label='File'):
     return href
 
 def main():
-    st.title("PDF Processor")
+    st.title("Pick sheet Processor")
 
     uploaded_excel = st.file_uploader("Upload Excel file", type="xlsx")
     uploaded_pdf = st.file_uploader("Upload PDF file", type="pdf")
@@ -191,4 +191,5 @@ def main():
                 logging.exception("An error occurred during processing")
 
 if __name__ == "__main__":
+
     main()
