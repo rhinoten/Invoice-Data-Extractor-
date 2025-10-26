@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
-import fitz  # PyMuPDF
+import PyPDF2
+import pdfplumber
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 import io
@@ -17,10 +18,8 @@ HARDCODED_COORDINATES = {
     'lot_x': 100,      # X position for Lot # field
     'lot_y': 540,      # Y position for Lot # field  
     'shipped_x': 540,  # X position for Shipped field
-    'shipped_y': 615 # Y position for Shipped field
+    'shipped_y': 615   # Y position for Shipped field
 }
-
-
 
 def read_excel_data(file):
     data = pd.read_excel(file)
@@ -41,7 +40,7 @@ def get_column_names(df):
     logging.info(f"Detected column names: {result}")
     return result
 
-def create_overlay_for_record(data_row, page_number, total_pages, page, column_names):
+def create_overlay_for_record(data_row, page_number, total_pages, column_names):
     """Create overlay for a single record using hardcoded coordinates"""
     packet = io.BytesIO()
     can = canvas.Canvas(packet, pagesize=letter)
@@ -77,47 +76,64 @@ def create_overlay_for_record(data_row, page_number, total_pages, page, column_n
 
     can.save()
     packet.seek(0)
-    return fitz.open(stream=packet, filetype="pdf")
+    return packet
+
+def merge_pdf_page(original_pdf_bytes, overlay_pdf_bytes):
+    """Merge original PDF page with overlay using PyPDF2"""
+    original_pdf = PyPDF2.PdfReader(original_pdf_bytes)
+    overlay_pdf = PyPDF2.PdfReader(overlay_pdf_bytes)
+    
+    # Create output PDF
+    output_pdf = PyPDF2.PdfWriter()
+    
+    # Merge the pages
+    original_page = original_pdf.pages[0]
+    overlay_page = overlay_pdf.pages[0]
+    
+    original_page.merge_page(overlay_page)
+    output_pdf.add_page(original_page)
+    
+    # Write to bytes
+    output_bytes = io.BytesIO()
+    output_pdf.write(output_bytes)
+    output_bytes.seek(0)
+    
+    return output_bytes
 
 def populate_pdf(input_pdf, output_pdf, data, progress_bar, column_names):
-    # Create a new PDF document
-    template_doc = fitz.open(input_pdf)
-    output_doc = fitz.open()
-    
     total_records = len(data)
+    
+    # Read the template PDF
+    with open(input_pdf, 'rb') as f:
+        template_pdf_bytes = f.read()
+    
+    # Create output PDF writer
+    output_pdf_writer = PyPDF2.PdfWriter()
     
     # Create one page per record
     for record_num in range(total_records):
-        # Use the first page as template for all records
-        if record_num < len(template_doc):
-            # Use existing page from template
-            page = template_doc[record_num]
-        else:
-            # Use first page as template for additional records
-            page = template_doc[0]
-        
-        # Add the page to output document
-        output_doc.insert_pdf(template_doc, from_page=min(record_num, len(template_doc)-1), to_page=min(record_num, len(template_doc)-1))
-        
-        # Get the current page in output document
-        current_page = output_doc[record_num]
         current_record = data.iloc[record_num]
         
         logging.info(f"Processing record {record_num + 1} of {total_records}")
         
         # Create overlay for this single record
-        overlay = create_overlay_for_record(
-            current_record, record_num + 1, total_records, current_page, column_names
+        overlay_packet = create_overlay_for_record(
+            current_record, record_num + 1, total_records, column_names
         )
         
-        # Apply the overlay
-        current_page.show_pdf_page(current_page.rect, overlay, 0)
+        # Merge overlay with template page
+        merged_page = merge_pdf_page(io.BytesIO(template_pdf_bytes), overlay_packet)
+        
+        # Add merged page to output PDF
+        merged_pdf = PyPDF2.PdfReader(merged_page)
+        output_pdf_writer.add_page(merged_pdf.pages[0])
         
         progress_bar.progress((record_num + 1) / total_records)
 
-    output_doc.save(output_pdf)
-    output_doc.close()
-    template_doc.close()
+    # Save the output PDF
+    with open(output_pdf, 'wb') as output_file:
+        output_pdf_writer.write(output_file)
+    
     logging.info(f"PDF saved to {output_pdf}")
 
 def get_binary_file_downloader_html(bin_file, file_label='File'):
