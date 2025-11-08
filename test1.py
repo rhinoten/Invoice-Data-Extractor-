@@ -136,15 +136,8 @@ def populate_pdf(input_pdf, output_pdf, data, progress_bar, column_names):
     
     logging.info(f"PDF saved to {output_pdf}")
 
-def get_binary_file_downloader_html(bin_file, file_label='File'):
-    with open(bin_file, 'rb') as f:
-        data = f.read()
-    bin_str = base64.b64encode(data).decode()
-    href = f'<a href="data:application/octet-stream;base64,{bin_str}" download="{bin_file}">Download {file_label}</a>'
-    return href
-
 def main():
-    st.title("Pick sheet Processor")
+    st.title("PDF Processor")
 
     uploaded_excel = st.file_uploader("Upload Excel file", type="xlsx")
     uploaded_pdf = st.file_uploader("Upload PDF file", type="pdf")
@@ -181,15 +174,24 @@ def main():
                 populate_pdf(input_pdf, output_pdf, data, progress_bar, column_names)
 
                 st.success(f"PDF processing completed successfully! Created {len(data)} pages.")
-                st.markdown(get_binary_file_downloader_html(output_pdf, 'Processed PDF'), unsafe_allow_html=True)
+                
+                # Auto-download the PDF
+                with open(output_pdf, "rb") as file:
+                    btn = st.download_button(
+                        label="Download Processed PDF",
+                        data=file,
+                        file_name=output_pdf,
+                        mime="application/pdf"
+                    )
 
-                # Clean up temp file
+                # Clean up temp files
                 os.unlink(input_pdf)
+                if os.path.exists(output_pdf):
+                    os.unlink(output_pdf)
 
             except Exception as e:
                 st.error(f"An error occurred: {str(e)}")
                 logging.exception("An error occurred during processing")
 
 if __name__ == "__main__":
-
     main()
