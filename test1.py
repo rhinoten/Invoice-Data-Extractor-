@@ -4,6 +4,8 @@ import PyPDF2
 import pdfplumber
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.lib.colors import white
 import io
 import re
 import logging
@@ -13,12 +15,14 @@ import os
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# HARDCODED COORDINATES - Update these after running the coordinate analyzer
+# HARDCODED COORDINATES 
 HARDCODED_COORDINATES = {
     'lot_x': 100,      # X position for Lot # field
     'lot_y': 540,      # Y position for Lot # field  
     'shipped_x': 540,  # X position for Shipped field
-    'shipped_y': 615   # Y position for Shipped field
+    'shipped_y': 615,  # Y position for Shipped field
+    'order_x': 493,      # X position for Order # field 
+    'order_y': 712       # Y position for Order # field 
 }
 
 def read_excel_data(file):
@@ -61,18 +65,39 @@ def create_overlay_for_record(data_row, page_number, total_pages, column_names):
     # Use hardcoded coordinates for precise placement
     lot_position = (HARDCODED_COORDINATES['lot_x'], HARDCODED_COORDINATES['lot_y'])
     shipped_position = (HARDCODED_COORDINATES['shipped_x'], HARDCODED_COORDINATES['shipped_y'])
+    order_position = (HARDCODED_COORDINATES['order_x'], HARDCODED_COORDINATES['order_y'])
+
+    # Order Number - with white background to overwrite existing text
+    if column_names['order_number'] and pd.notna(data_row[column_names['order_number']]):
+        order_text = f"{data_row[column_names['order_number']]}"
+        
+        # Save the current font settings
+        current_font = can._fontname
+        current_font_size = can._fontsize
+        
+        # Draw white rectangle as background (adjust width as needed)
+        can.setFillColor(white)
+        can.rect(order_position[0] - 2, order_position[1] - 2, 80, 20, fill=1, stroke=0)
+        
+        # Draw order number text with custom font size
+        can.setFont("Helvetica", 7)  # Set font size for order number only
+        can.setFillColorRGB(0, 0, 0)  # Black text
+        can.drawString(order_position[0], order_position[1], order_text)
+        
+        # Restore the original font settings for other text
+        can.setFont(current_font, current_font_size)
+        
+   
 
     # Lot Number - using hardcoded coordinates
     if column_names['lot_number'] and pd.notna(data_row[column_names['lot_number']]):
         lot_text = f"{data_row[column_names['lot_number']]}"
         can.drawString(lot_position[0], lot_position[1], lot_text)
-        logging.debug(f"Added lot number: {lot_text} at {lot_position}")
 
     # Quantity - using hardcoded coordinates
     if column_names['quantity'] and pd.notna(data_row[column_names['quantity']]):
         qty_text = f"{int(data_row[column_names['quantity']])}"
         can.drawString(shipped_position[0], shipped_position[1], qty_text)
-        logging.debug(f"Added quantity: {qty_text} at {shipped_position}")
 
     can.save()
     packet.seek(0)
@@ -148,8 +173,8 @@ def main():
                 data = read_excel_data(uploaded_excel)
                 column_names = get_column_names(data)
 
-                st.write("Detected column names:", column_names)
-                st.write(f"Total records in Excel: {len(data)}")
+                # st.write("Detected column names:", column_names)
+                # st.write(f"Total records in Excel: {len(data)}")
 
                 if not any(column_names.values()):
                     st.error("No matching column names found in the Excel file. Please check your column names.")
@@ -161,6 +186,9 @@ def main():
                     return
                 if not column_names['quantity']:
                     st.error("No 'Quantity' column found in Excel file.")
+                    return
+                if not column_names['order_number']:
+                    st.error("No 'Order #' column found in Excel file.")
                     return
 
                 # Save uploaded PDF temporarily
