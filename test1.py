@@ -5,7 +5,7 @@ import pdfplumber
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
-from reportlab.lib.colors import white
+from reportlab.lib.colors import white, black
 import io
 import re
 import base64
@@ -35,6 +35,18 @@ POSITION_COORDINATES = {
     }
 }
 
+# Coordinates for "IN-PROCESS SHIPPING" comment
+COMMENT_COORDINATES = {
+    'x': 360,   
+    'y': 750    
+}
+
+# Coordinates for page numbers
+PAGE_NUMBER_COORDS = {
+    'x': 500,
+    'y': 780
+}
+
 def extract_page_data_with_positions(page_text, page_num):
     """Extract order number and item numbers with their positions"""
     data = {
@@ -43,8 +55,8 @@ def extract_page_data_with_positions(page_text, page_num):
         'raw_text': page_text
     }
     
-    # FIXED: Extract order number - now handles both numeric and alphanumeric (M005582, etc.)
-    order_pattern = r'Order\s*Number:\s*([A-Z0-9]+)'  # Changed from (\d+) to ([A-Z0-9]+)
+    # Extract order number - handles both numeric and alphanumeric
+    order_pattern = r'Order\s*Number:\s*([A-Z0-9]+)'
     order_match = re.search(order_pattern, page_text, re.IGNORECASE)
     if order_match:
         data['order_number'] = order_match.group(1)
@@ -71,7 +83,6 @@ def extract_page_data_with_positions(page_text, page_num):
                 for pattern in patterns:
                     if re.match(pattern, potential_item):
                         item_counter += 1
-                        # Position is determined by the order we find items (1st, 2nd, 3rd)
                         data['item_positions'].append({
                             'item_number': potential_item,
                             'position': item_counter,
@@ -79,7 +90,6 @@ def extract_page_data_with_positions(page_text, page_num):
                         })
                         break
     
-    # Also extract just the item numbers for backward compatibility
     data['item_numbers'] = [item['item_number'] for item in data['item_positions']]
     
     return data
@@ -103,41 +113,51 @@ def get_coordinates_for_page(lot_count):
 
 def get_column_names(df):
     """Get column names with exact matching"""
-    # Create a case-insensitive mapping
     df_columns_lower = [str(col).lower().strip() for col in df.columns]
     actual_columns = list(df.columns)
     
     column_mapping = {}
     
-    # Define what we're looking for (case insensitive)
     targets = {
         'order_number': ['order #', 'order number', 'order no', 'order'],
         'part_number': ['part #', 'part number', 'part no', 'part'],
         'quantity': ['quantity', 'qty', 'shipping quantity'],
-        'lot_number': ['lot #', 'lot number', 'lot no', 'lot']
+        'lot_number': ['lot #', 'lot number', 'lot no', 'lot'],
+        'order_comments': ['order comments', 'comments', 'order comment']
     }
     
     for key, possible_names in targets.items():
         found_column = None
         for possible_name in possible_names:
             if possible_name in df_columns_lower:
-                # Find the actual column name that matches
                 idx = df_columns_lower.index(possible_name)
                 found_column = actual_columns[idx]
                 break
-        
         column_mapping[key] = found_column
     
     return column_mapping
 
-def create_overlay_for_matched_records(data, matched_records, page_number, total_pages, coordinates, column_names, positions_used=None):
-    """Create overlay for matched records with position awareness"""
+def check_in_process_shipping_for_order(data, order_number, column_names):
+    """Check if any record with this order number has 'IN-PROCESS SHIPPING' comment"""
+    if not column_names['order_comments']:
+        return False
+    
+    for _, record in data.iterrows():
+        record_order = str(record[column_names['order_number']]).strip()
+        if record_order == order_number:
+            comments = str(record[column_names['order_comments']]).strip().upper()
+            if 'IN-PROCESS SHIPPING' in comments:
+                return True
+    return False
+
+def create_overlay_for_matched_records(data, matched_records, coordinates, column_names, positions_used=None, add_in_process_comment=False):
+    """Create overlay for matched records WITHOUT page numbers"""
     packet = io.BytesIO()
     can = canvas.Canvas(packet, pagesize=letter)
 
-    # Add page number
-    page_number_pos = (500, 780)
-    can.drawString(page_number_pos[0], page_number_pos[1], f"Page {page_number} of {total_pages}")
+    # Add "IN-PROCESS SHIPPING" comment if needed
+    if add_in_process_comment:
+        can.drawString(COMMENT_COORDINATES['x'], COMMENT_COORDINATES['y'], "IN-PROCESS SHIPPING")
 
     # Fill each entry space with data from matched records
     for i, record_idx in enumerate(matched_records):
@@ -146,7 +166,6 @@ def create_overlay_for_matched_records(data, matched_records, page_number, total
             
         current_record = data.iloc[record_idx]
         
-        # Use the actual position if provided, otherwise use sequential order
         if positions_used and i < len(positions_used):
             position = positions_used[i]
             coord_set = coordinates[position - 1]
@@ -163,6 +182,29 @@ def create_overlay_for_matched_records(data, matched_records, page_number, total
         if column_names['quantity'] and pd.notna(current_record[column_names['quantity']]):
             qty_text = f"{int(current_record[column_names['quantity']])}"
             can.drawString(coord_set['shipped_x'], coord_set['shipped_y'], qty_text)
+
+    can.save()
+    packet.seek(0)
+    return packet
+
+def create_page_number_overlay(page_number, total_pages):
+    """Create overlay with just the page number"""
+    packet = io.BytesIO()
+    can = canvas.Canvas(packet, pagesize=letter)
+
+    # Add white rectangle to cover original page numbers
+    rect_width = 80
+    rect_height = 20
+    
+    # Draw white rectangle to cover the area where page numbers go
+    can.setFillColor(white)
+    can.rect(PAGE_NUMBER_COORDS['x'] - 5, PAGE_NUMBER_COORDS['y'] - 5, rect_width, rect_height, fill=1, stroke=0)
+    
+    # Reset fill color to black for text
+    can.setFillColor(black)
+    
+    # Add page number on top of the white rectangle
+    can.drawString(PAGE_NUMBER_COORDS['x'], PAGE_NUMBER_COORDS['y'], f"Page {page_number} of {total_pages}")
 
     can.save()
     packet.seek(0)
@@ -190,12 +232,47 @@ def read_excel_data(file):
     data = pd.read_excel(file)
     return data
 
+def add_page_numbers_to_final_pdf(pdf_bytes):
+    """Add page numbers to the final PDF after all processing"""
+    original_pdf = PyPDF2.PdfReader(pdf_bytes)
+    output_pdf_writer = PyPDF2.PdfWriter()
+    total_pages = len(original_pdf.pages)
+    
+    for page_num in range(total_pages):
+        # Create page number overlay for this page
+        page_number_overlay = create_page_number_overlay(page_num + 1, total_pages)
+        
+        # Convert current page to bytes
+        page_bytes = io.BytesIO()
+        temp_writer = PyPDF2.PdfWriter()
+        temp_writer.add_page(original_pdf.pages[page_num])
+        temp_writer.write(page_bytes)
+        page_bytes.seek(0)
+        
+        # Merge page number overlay with the page
+        merged_page = merge_pdf_page(page_bytes, page_number_overlay)
+        merged_pdf = PyPDF2.PdfReader(merged_page)
+        output_pdf_writer.add_page(merged_pdf.pages[0])
+    
+    # Save the final PDF with page numbers
+    final_bytes = io.BytesIO()
+    output_pdf_writer.write(final_bytes)
+    final_bytes.seek(0)
+    
+    return final_bytes
+
 def populate_pdf_correct_matching(input_pdf, output_pdf, data, progress_bar, column_names):
-    """Process PDF with CORRECT matching and position handling"""
+    """Process PDF with CORRECT matching, position handling, blank page removal, and comments"""
     template_doc = PyPDF2.PdfReader(input_pdf)
     output_pdf_writer = PyPDF2.PdfWriter()
     processed_records = set()
     total_records = len(data)
+    
+    # Track which order numbers need "IN-PROCESS SHIPPING" comment
+    order_comments_cache = {}
+    
+    # Store pages temporarily to remove blank ones later
+    processed_pages = []
     
     for page_num in range(len(template_doc.pages)):
         if len(processed_records) >= total_records:
@@ -206,7 +283,7 @@ def populate_pdf_correct_matching(input_pdf, output_pdf, data, progress_bar, col
             page_text = pdf.pages[page_num].extract_text() or ""
         
         if not page_text.strip():
-            output_pdf_writer.add_page(template_doc.pages[page_num])
+            # Skip completely blank pages
             continue
         
         page_data = extract_page_data_with_positions(page_text, page_num + 1)
@@ -214,9 +291,15 @@ def populate_pdf_correct_matching(input_pdf, output_pdf, data, progress_bar, col
         entry_spaces, coordinates = get_coordinates_for_page(lot_count)
         
         # Find matching records for this page
-        matched_records = []  # This will store (record_idx, position) pairs
+        matched_records = []
         
         if page_data['order_number'] and page_data['item_positions']:
+            # Check if this order needs "IN-PROCESS SHIPPING" comment
+            order_number = page_data['order_number']
+            if order_number not in order_comments_cache:
+                order_comments_cache[order_number] = check_in_process_shipping_for_order(data, order_number, column_names)
+            add_comment = order_comments_cache[order_number]
+            
             # For each item on the page, find the EXACT matching record
             for item_info in page_data['item_positions']:
                 page_item = item_info['item_number']
@@ -225,28 +308,30 @@ def populate_pdf_correct_matching(input_pdf, output_pdf, data, progress_bar, col
                 if item_position > entry_spaces:
                     continue
                     
-                # Find record with matching order number AND matching item number
                 for idx, record in data.iterrows():
                     if idx not in processed_records and idx not in [r[0] for r in matched_records]:
                         record_order = str(record[column_names['order_number']]).strip()
                         record_part = str(record[column_names['part_number']]).strip()
                         page_order = str(page_data['order_number']).strip()
                         
-                        # Check BOTH order number AND item number
                         if record_order == page_order and record_part == str(page_item).strip():
                             matched_records.append((idx, item_position))
                             break
         
-        # Create overlay if we have matches
+        # Only add page if it has matches OR has "IN-PROCESS SHIPPING" comment
         if matched_records:
             try:
-                # Sort matched records by position to ensure correct placement
                 matched_records.sort(key=lambda x: x[1])
                 record_indices = [r[0] for r in matched_records]
                 positions_used = [r[1] for r in matched_records]
                 
+                # Check again for comment in case new records were found
+                if page_data['order_number'] and page_data['order_number'] not in order_comments_cache:
+                    order_comments_cache[page_data['order_number']] = check_in_process_shipping_for_order(data, page_data['order_number'], column_names)
+                add_comment = order_comments_cache.get(page_data['order_number'], False)
+                
                 overlay_packet = create_overlay_for_matched_records(
-                    data, record_indices, page_num + 1, len(template_doc.pages), coordinates, column_names, positions_used
+                    data, record_indices, coordinates, column_names, positions_used, add_comment
                 )
                 
                 template_page_bytes = io.BytesIO()
@@ -257,24 +342,76 @@ def populate_pdf_correct_matching(input_pdf, output_pdf, data, progress_bar, col
                 
                 merged_page = merge_pdf_page(template_page_bytes, overlay_packet)
                 merged_pdf = PyPDF2.PdfReader(merged_page)
-                output_pdf_writer.add_page(merged_pdf.pages[0])
                 
-                # Mark records as processed
+                # Store the processed page
+                processed_pages.append(merged_pdf.pages[0])
+                
                 processed_records.update(record_indices)
                 
             except Exception as e:
-                output_pdf_writer.add_page(template_doc.pages[page_num])
-        else:
-            output_pdf_writer.add_page(template_doc.pages[page_num])
+                # Skip pages with errors (treat as blank)
+                continue
+    
+    # Update order comments for all pages in case comments were found later
+    final_pages = []
+    for page in processed_pages:
+        # Extract order number from the page text to check for comments
+        page_text = ""
+        try:
+            output_bytes = io.BytesIO()
+            temp_writer = PyPDF2.PdfWriter()
+            temp_writer.add_page(page)
+            temp_writer.write(output_bytes)
+            output_bytes.seek(0)
+            
+            with pdfplumber.open(output_bytes) as pdf:
+                if pdf.pages:
+                    page_text = pdf.pages[0].extract_text() or ""
+        except:
+            pass
         
-        progress_bar.progress(min(len(processed_records) / total_records, 1.0))
-
-    # Save output PDF
-    try:
-        with open(output_pdf, 'wb') as output_file:
-            output_pdf_writer.write(output_file)
-    except Exception as e:
-        st.error(f"Error saving PDF: {e}")
+        # Check if this page needs "IN-PROCESS SHIPPING" comment
+        order_match = re.search(r'Order\s*Number:\s*([A-Z0-9]+)', page_text, re.IGNORECASE)
+        if order_match:
+            order_number = order_match.group(1)
+            if order_number in order_comments_cache and order_comments_cache[order_number]:
+                # Recreate overlay with comment
+                try:
+                    overlay_packet = create_overlay_for_matched_records(
+                        data, [], [], column_names, [], True
+                    )
+                    
+                    page_bytes = io.BytesIO()
+                    temp_writer = PyPDF2.PdfWriter()
+                    temp_writer.add_page(page)
+                    temp_writer.write(page_bytes)
+                    page_bytes.seek(0)
+                    
+                    merged_page = merge_pdf_page(page_bytes, overlay_packet)
+                    merged_pdf = PyPDF2.PdfReader(merged_page)
+                    final_pages.append(merged_pdf.pages[0])
+                    continue
+                except:
+                    pass
+        
+        final_pages.append(page)
+    
+    # Add only non-blank pages to final output (without page numbers first)
+    temp_output = io.BytesIO()
+    temp_writer = PyPDF2.PdfWriter()
+    for page in final_pages:
+        temp_writer.add_page(page)
+    temp_writer.write(temp_output)
+    temp_output.seek(0)
+    
+    # NEW: Add page numbers to the final PDF
+    final_pdf_with_numbers = add_page_numbers_to_final_pdf(temp_output)
+    
+    # Save the final PDF with proper page numbers
+    with open(output_pdf, 'wb') as output_file:
+        output_file.write(final_pdf_with_numbers.getvalue())
+    
+    progress_bar.progress(1.0)
 
 def main():
     st.title("PDF Processor - Automated Form Filling")
@@ -299,7 +436,6 @@ def main():
                     st.info("Please ensure your Excel has: Order #, Part #, Quantity, and Lot # columns")
                     return
 
-                # Show mapping confirmation
                 st.success("✅ Column mapping successful!")
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_input:
@@ -309,7 +445,6 @@ def main():
                 output_pdf = "Populated_Picking_Sheet.pdf"
                 progress_bar = st.progress(0)
                 
-                # Use the matching function
                 populate_pdf_correct_matching(input_pdf, output_pdf, data, progress_bar, column_names)
 
                 st.success(f"PDF processing completed successfully!")
