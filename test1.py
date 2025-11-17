@@ -37,7 +37,7 @@ POSITION_COORDINATES = {
 
 # Coordinates for "IN-PROCESS SHIPPING" comment
 COMMENT_COORDINATES = {
-    'x': 100,
+    'x': 360,
     'y': 750
 }
 
@@ -406,3 +406,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
