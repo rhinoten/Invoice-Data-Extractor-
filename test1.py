@@ -71,7 +71,17 @@ def extract_page_data_with_positions(page_text, page_num):
         r'^[A-Za-z0-9.]+-[A-Za-z0-9.]+$',                       
         r'^[A-Za-z0-9.]+-[A-Za-z0-9.]+-[A-Za-z0-9.]+$',         
         r'^[A-Za-z0-9.]+-[A-Za-z0-9.]+-[A-Za-z0-9.]+-[A-Za-z0-9.]+$',  
-        r'^[A-Za-z0-9]*\d+[A-Za-z0-9]*$'                         
+        r'^[A-Za-z0-9]*\d+[A-Za-z0-9]*$',
+        r'^[A-Za-z]+-\d+-\d+[A-Za-z]*$',
+        r'^[A-Za-z0-9.]+-[A-Za-z0-9.]+$',     
+        r'^[A-Za-z0-9.]+-[A-Za-z0-9.]+-[A-Za-z0-9.]+$',   
+        r'^[A-Za-z0-9.]+-[A-Za-z0-9.]+-[A-Za-z0-9.]+-[A-Za-z0-9.]+$',   
+        r'^[A-Za-z0-9.]+-[A-Za-z0-9.]+-[A-Za-z0-9.]+-[A-Za-z0-9.]+-[A-Za-z0-9.]+$',  
+        r'^[A-Za-z]+-[0-9/]+-[0-9]+$',      
+        r'^[A-Za-z]+-C[0-9/]+-[0-9]+$',     
+        r'^[A-Za-z0-9]*\d+[A-Za-z0-9]*$',   
+        r'^[A-Za-z]+-[0-9]+[A-Z]?-[0-9]+-[0-9]+$',   
+        r'^[A-Za-z]+-[0-9]+[A-Z]?-[0-9]+$',
     ]
     
     for line in lines:
@@ -117,10 +127,10 @@ def get_column_names(df):
     column_mapping = {}
     
     targets = {
-        'order_number': ['order #', 'order number', 'order no', 'order'],
-        'part_number': ['part #', 'part number', 'part no', 'part'],
+        'order_number': ['order #', 'order number', 'order no', 'order', 'Order #'],
+        'part_number': ['part #', 'part number', 'part no', 'part', 'Part #'],
         'quantity': ['quantity', 'qty', 'shipping quantity'],
-        'lot_number': ['lot #', 'lot number', 'lot no', 'lot'],
+        'lot_number': ['lot #', 'lot number', 'lot no', 'lot', 'Lot #'],
         'order_comments': ['order comments', 'comments', 'order comment', 'Order Comments']
     }
     
@@ -140,10 +150,11 @@ def check_in_process_shipping_for_order(data, order_number, column_names):
     """Check if any record with this order number has 'IN-PROCESS SHIPPING' or 'IN PROCESS SHIPPING' comment"""
     if not column_names['order_comments']:
         return False
+    normalized_order = str(order_number).strip().lstrip('0')
     
     for _, record in data.iterrows():
-        record_order = str(record[column_names['order_number']]).strip()
-        if record_order == order_number:
+        record_order = str(record[column_names['order_number']]).strip().lstrip('0')
+        if record_order == normalized_order:
             comments = str(record[column_names['order_comments']]).strip().upper()
             if 'IN-PROCESS SHIPPING' in comments or 'IN PROCESS SHIPPING' in comments:
                 return True
@@ -287,9 +298,11 @@ def populate_pdf_correct_matching(input_pdf, output_pdf, data, progress_bar, col
         
         if page_data['order_number'] and page_data['item_positions']:
             order_number = page_data['order_number']
-            if order_number not in order_comments_cache:
-                order_comments_cache[order_number] = check_in_process_shipping_for_order(data, order_number, column_names)
-            add_comment = order_comments_cache[order_number]
+
+            cache_key = str(order_number).strip().lstrip('0')
+            if cache_key not in order_comments_cache:
+                order_comments_cache[cache_key] = check_in_process_shipping_for_order(data, order_number, column_names)
+            add_comment = order_comments_cache[cache_key]
             
             for item_info in page_data['item_positions']:
                 page_item = item_info['item_number']
@@ -304,7 +317,7 @@ def populate_pdf_correct_matching(input_pdf, output_pdf, data, progress_bar, col
                         record_part = str(record[column_names['part_number']]).strip()
                         page_order = str(page_data['order_number']).strip()
                         
-                        if record_order == page_order and record_part == str(page_item).strip():
+                        if record_order.lstrip('0') == page_order.lstrip('0') and record_part == str(page_item).strip():
                             matched_records.append((idx, item_position))
                             break
         
@@ -314,13 +327,13 @@ def populate_pdf_correct_matching(input_pdf, output_pdf, data, progress_bar, col
                 record_indices = [r[0] for r in matched_records]
                 positions_used = [r[1] for r in matched_records]
                 
-                if page_data['order_number'] and page_data['order_number'] not in order_comments_cache:
-                    order_comments_cache[page_data['order_number']] = check_in_process_shipping_for_order(data, page_data['order_number'], column_names)
-                add_comment = order_comments_cache.get(page_data['order_number'], False)
+                cache_key = str(page_data['order_number']).strip().lstrip('0')
+                if cache_key not in order_comments_cache:
+                    order_comments_cache[cache_key] = check_in_process_shipping_for_order(data, page_data['order_number'], column_names)
+                add_comment = order_comments_cache.get(cache_key, False)
                 
                 overlay_packet = create_overlay_for_matched_records(
-                    data, record_indices, coordinates, column_names, positions_used, add_comment
-                )
+                    data, record_indices, coordinates, column_names, positions_used, add_comment)
                 
                 template_page_bytes = safe_create_pdf_page(template_doc.pages[page_num])
                 if template_page_bytes is None:
@@ -348,6 +361,7 @@ def populate_pdf_correct_matching(input_pdf, output_pdf, data, progress_bar, col
         st.error(f"Error saving final PDF: {e}")
     
     progress_bar.progress(1.0)
+
 
 def main():
     st.title("PDF Processor - Automated Form Filling")
